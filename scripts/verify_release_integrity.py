@@ -42,16 +42,55 @@ def _sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def _retry_json(url: str, attempts: int = 12) -> dict[str, object]:
+def _pypi_hashes(payload: dict[str, object]) -> dict[str, str]:
+    urls = payload.get("urls")
+    if not isinstance(urls, list):
+        raise ValueError("PyPI 响应缺少 urls")
+    hashes: dict[str, str] = {}
+    for item in urls:
+        if not isinstance(item, dict):
+            raise ValueError("PyPI urls 包含无效条目")
+        filename = item.get("filename")
+        digests = item.get("digests")
+        if (
+            not isinstance(filename, str)
+            or not isinstance(digests, dict)
+            or not isinstance(digests.get("sha256"), str)
+        ):
+            raise ValueError("PyPI 发行文件元数据无效")
+        hashes[filename] = digests["sha256"]
+    return hashes
+
+
+def _pypi_mismatch(actual: dict[str, str], expected: dict[str, str]) -> ValueError:
+    if set(actual) != set(expected):
+        return ValueError(
+            f"PyPI 文件集合不一致：{sorted(actual)} != {sorted(expected)}"
+        )
+    mismatched = sorted(name for name, digest in expected.items() if actual[name] != digest)
+    return ValueError(f"PyPI 哈希不一致：{mismatched}")
+
+
+def _retry_pypi_hashes(
+    url: str, expected: dict[str, str], attempts: int = 12
+) -> dict[str, str]:
+    last_mismatch: ValueError | None = None
     for attempt in range(attempts):
         try:
-            return json.loads(_request(url))
+            payload = json.loads(_request(url))
+            actual = _pypi_hashes(payload)
+            if actual == expected:
+                return actual
+            last_mismatch = _pypi_mismatch(actual, expected)
         except urllib.error.HTTPError as exc:
             if exc.code not in {404, 429, 500, 502, 503, 504} or attempt == attempts - 1:
                 raise
         except urllib.error.URLError:
             if attempt == attempts - 1:
                 raise
+        if attempt == attempts - 1:
+            assert last_mismatch is not None
+            raise last_mismatch
         time.sleep(5)
     raise AssertionError("unreachable")
 
@@ -190,16 +229,10 @@ def main() -> int:
         )
     )
     _verify_github_assets(github, local)
-    pypi = _retry_json(f"https://pypi.org/pypi/codex-notify/{version}/json")
-    pypi_hashes = {
-        item["filename"]: item["digests"]["sha256"] for item in pypi["urls"]
-    }
-    if set(pypi_hashes) != set(local):
-        raise ValueError(f"PyPI 文件集合不一致：{sorted(pypi_hashes)} != {sorted(local)}")
-
-    for filename, expected in local.items():
-        if pypi_hashes.get(filename) != expected:
-            raise ValueError(f"PyPI 哈希不一致：{filename}")
+    _retry_pypi_hashes(
+        f"https://pypi.org/pypi/codex-notify/{version}/json",
+        local,
+    )
     print(json.dumps(local, indent=2, sort_keys=True))
     return 0
 

@@ -149,6 +149,38 @@ class ReleaseIntegrityTests(unittest.TestCase):
 
             request.assert_called_once()
 
+    def test_pypi_hash_check_retries_incomplete_success_response(self):
+        expected = {
+            "codex_notify-0.1.0-py3-none-any.whl": "wheel-digest",
+            "codex_notify-0.1.0.tar.gz": "sdist-digest",
+        }
+        partial = {
+            "urls": [
+                {
+                    "filename": "codex_notify-0.1.0-py3-none-any.whl",
+                    "digests": {"sha256": "wheel-digest"},
+                }
+            ]
+        }
+        complete = {
+            "urls": [
+                {"filename": filename, "digests": {"sha256": digest}}
+                for filename, digest in expected.items()
+            ]
+        }
+        with patch.object(
+            verify_release_integrity,
+            "_request",
+            side_effect=[json.dumps(partial).encode(), json.dumps(complete).encode()],
+        ) as request, patch.object(verify_release_integrity.time, "sleep") as sleep:
+            result = verify_release_integrity._retry_pypi_hashes(
+                "https://pypi.example/project.json", expected, attempts=2
+            )
+
+        self.assertEqual(result, expected)
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(5)
+
 
 if __name__ == "__main__":
     unittest.main()
