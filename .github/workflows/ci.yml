@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: PYTHONPATH=src PYTHONWARNINGS=error::ResourceWarning python -m unittest discover -s tests -v
+      - run: PYTHONPATH=src python scripts/verify_wheel_install.py
+      - run: python -m compileall -q src scripts tests
+      - name: Check committed whitespace
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            git diff --check "$PR_BASE_SHA...HEAD"
+          elif [[ -n "$BEFORE_SHA" && ! "$BEFORE_SHA" =~ ^0+$ ]] \
+            && git cat-file -e "$BEFORE_SHA^{commit}"; then
+            git diff --check "$BEFORE_SHA..HEAD"
+          else
+            git show --check --format= HEAD
+          fi
+
+  package:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade build twine
+      - run: python -m build
+      - run: python -m twine check dist/*
+      - name: Verify wheel without source checkout
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/codex-notify-wheel"
+          "$RUNNER_TEMP/codex-notify-wheel/bin/python" -m pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/codex-notify-wheel/bin/codex-notify" --version
+          "$RUNNER_TEMP/codex-notify-wheel/bin/python" "$GITHUB_WORKSPACE/scripts/verify_wheel_install.py"
+          "$RUNNER_TEMP/codex-notify-wheel/bin/python" - <<'PY'
+          from pathlib import Path
+          import codex_notify
+          from codex_notify.installer import Installer
+
+          package_dir = Path(codex_notify.__file__).resolve().parent
+          Installer(package_dir)._validate_source()
+          PY
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_VERSION: 8.30.1

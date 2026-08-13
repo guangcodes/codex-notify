@@ -1,0 +1,32 @@
+title = "codex-notify gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Deliberate fake credentials used only by redaction regression tests"
+condition = "AND"
+regexTarget = "match"
+paths = [
+  '''^tests/test_redact\.py$''',
+]
+regexes = [
+  '''AKIAIOSFODNN7EXAMPLE''',
+  '''ghp_abcdefghijklmnopqrstuvwxyz1234567890''',
+  '''sk-proj-abcdefghijklmnop''',
+  '''xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwxyz''',
+  '''open\.feishu\.cn/open-apis/bot/v2/hook/secret-hook-id''',
+  '''glpat-abcdefghijklmnopqrst''',
+  '''eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxMjM0NTY3ODkwIn0\.fakeSignatureValue''',
+]
+
+[[allowlists]]
+description = "Exact fake JWT used by the database redaction regression test"
+condition = "AND"
+regexTarget = "match"
+paths = [
+  '''^tests/test_db\.py$''',
+]
+regexes = [
+  '''eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxMjM0NTY3ODkwIn0\.fakeSignatureValue''',
+]

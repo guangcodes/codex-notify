@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.coverage
+htmlcov/
+.pytest_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Runtime state and credentials never belong in Git.
+data/
+logs/
+*.sqlite3
+*.sqlite3-*

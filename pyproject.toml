@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-notify"
+dynamic = ["version"]
+description = "为 Codex Turn 启动和完成事件提供可靠的飞书通知"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "guangcodes" }]
+dependencies = []
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: MacOS X",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Communications",
+]
+
+[project.urls]
+Homepage = "https://github.com/guangcodes/codex-notify"
+Repository = "https://github.com/guangcodes/codex-notify"
+Issues = "https://github.com/guangcodes/codex-notify/issues"
+
+[project.scripts]
+codex-notify = "codex_notify.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.dynamic]
+version = { attr = "codex_notify.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
