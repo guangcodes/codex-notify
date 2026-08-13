@@ -11,6 +11,13 @@ from scripts import verify_release_integrity
 
 
 class DistributionContentsTests(unittest.TestCase):
+    def test_macos_home_path_without_trailing_slash_is_rejected(self):
+        sensitive_home = b"/" + b"Users/example"
+        for content in (sensitive_home, b"HOME=" + sensitive_home):
+            with self.subTest(content=content):
+                with self.assertRaisesRegex(ValueError, "macOS 用户绝对路径"):
+                    verify_distribution_contents._verify_entry("fixture.sh", content)
+
     def test_sensitive_path_in_unlisted_text_suffix_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "codex_notify-0.1.0"

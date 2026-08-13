@@ -27,7 +27,9 @@ FORBIDDEN_PARTS = {
 }
 FORBIDDEN_SUFFIXES = {".log", ".pyc", ".pyo", ".swp"}
 PRIVATE_TEXT_PATTERNS = {
-    "macOS 用户绝对路径": re.compile(rb"/Users/[A-Za-z0-9._-]+/"),
+    "macOS 用户绝对路径": re.compile(
+        rb"/Users/[A-Za-z0-9._-]+(?=/|[^A-Za-z0-9._-]|$)"
+    ),
     "Codex 私有技能或记忆路径": re.compile(rb"\.codex/(?:skills|memories)/"),
     "本机名称": re.compile(rb"[A-Za-z0-9._-]+sMacBook", re.IGNORECASE),
 }
