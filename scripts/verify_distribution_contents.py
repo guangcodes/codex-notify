@@ -31,18 +31,6 @@ PRIVATE_TEXT_PATTERNS = {
     "Codex 私有技能或记忆路径": re.compile(rb"\.codex/(?:skills|memories)/"),
     "本机名称": re.compile(rb"[A-Za-z0-9._-]+sMacBook", re.IGNORECASE),
 }
-TEXT_SUFFIXES = {
-    ".cfg",
-    ".ini",
-    ".json",
-    ".md",
-    ".py",
-    ".toml",
-    ".txt",
-    ".yaml",
-    ".yml",
-}
-TEXT_FILENAMES = {"METADATA", "PKG-INFO", "RECORD", "SOURCES.txt", "entry_points.txt"}
 SDIST_ALLOWED_TOP_LEVEL = {
     "LICENSE",
     "PKG-INFO",
@@ -68,9 +56,7 @@ def _verify_entry(name: str, content: bytes | None) -> None:
         raise ValueError(f"归档包含不应发布的路径：{name}")
     if path.suffix.lower() in FORBIDDEN_SUFFIXES:
         raise ValueError(f"归档包含不应发布的文件：{name}")
-    if content is None or (
-        path.suffix.lower() not in TEXT_SUFFIXES and path.name not in TEXT_FILENAMES
-    ):
+    if content is None:
         return
     for label, pattern in PRIVATE_TEXT_PATTERNS.items():
         if pattern.search(content):

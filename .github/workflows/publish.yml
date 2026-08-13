@@ -66,14 +66,19 @@ jobs:
         with:
           name: python-package
           path: dist/
-      - name: Attach the exact distribution files to the GitHub Release
+      - name: Idempotently attach exact files to the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: >-
-          gh release upload "$RELEASE_TAG" dist/*.whl dist/*.tar.gz
-          --repo "${{ github.repository }}" --clobber
+          python scripts/verify_release_integrity.py
+          --repository "${{ github.repository }}"
+          --tag "$RELEASE_TAG"
+          --dist dist
+          --ensure-github-assets
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
       - name: Verify GitHub Release and PyPI hashes
         env:
           GH_TOKEN: ${{ github.token }}
