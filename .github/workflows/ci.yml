@@ -46,21 +46,37 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       - run: python -m pip install --upgrade build twine
       - run: python -m build
       - run: python -m twine check dist/*
-      - name: Verify wheel without source checkout
+      - name: Verify distribution contents
+        run: python scripts/verify_distribution_contents.py dist/*.whl dist/*.tar.gz
+      - name: Verify wheel and clone lifecycle equivalence
         shell: bash
         run: |
-          python -m venv "$RUNNER_TEMP/codex-notify-wheel"
-          "$RUNNER_TEMP/codex-notify-wheel/bin/python" -m pip install dist/*.whl
+          wheel_dir="$RUNNER_TEMP/codex-notify-wheel"
+          clone_dir="$RUNNER_TEMP/codex-notify-clone"
+          python -m venv "$wheel_dir/venv"
+          "$wheel_dir/venv/bin/python" -m pip install dist/*.whl
+          git clone --no-local "$GITHUB_WORKSPACE" "$clone_dir/source"
+          git -C "$clone_dir/source" fetch "$GITHUB_WORKSPACE" HEAD
+          git -C "$clone_dir/source" checkout --detach FETCH_HEAD
+          python -m venv "$clone_dir/venv"
+          "$clone_dir/venv/bin/python" -m pip install "$clone_dir/source"
           cd "$RUNNER_TEMP"
-          "$RUNNER_TEMP/codex-notify-wheel/bin/codex-notify" --version
-          "$RUNNER_TEMP/codex-notify-wheel/bin/python" "$GITHUB_WORKSPACE/scripts/verify_wheel_install.py"
-          "$RUNNER_TEMP/codex-notify-wheel/bin/python" - <<'PY'
+          "$wheel_dir/venv/bin/codex-notify" --version
+          "$clone_dir/venv/bin/codex-notify" --version
+          "$wheel_dir/venv/bin/python" "$GITHUB_WORKSPACE/scripts/verify_wheel_install.py" \
+            --snapshot "$wheel_dir/snapshot.json"
+          "$clone_dir/venv/bin/python" "$clone_dir/source/scripts/verify_wheel_install.py" \
+            --snapshot "$clone_dir/snapshot.json"
+          diff -u "$wheel_dir/snapshot.json" "$clone_dir/snapshot.json"
+          "$wheel_dir/venv/bin/python" - <<'PY'
           from pathlib import Path
           import codex_notify
           from codex_notify.installer import Installer
