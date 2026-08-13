@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from codex_notify import installer as installer_module
+from codex_notify import __version__, installer as installer_module
 from codex_notify.computer_use import decode_previous_notify, encode_previous_notify
 from codex_notify.installer import Installer
 
@@ -280,7 +280,7 @@ class InstallerTests(unittest.TestCase):
             self.installer.paths.install_state.read_text(encoding="utf-8")
         )
         self.assertEqual(upgraded["schema_version"], installer_module.INSTALL_STATE_VERSION)
-        self.assertEqual(upgraded["runtime_version"], "0.1.0")
+        self.assertEqual(upgraded["runtime_version"], __version__)
 
     def test_install_migrates_owned_legacy_launch_agent(self):
         self.installer.install(start_agent=False)
@@ -1816,7 +1816,7 @@ class InstallerTests(unittest.TestCase):
 
         self.assertEqual(self.installer.paths.install_state.stat().st_mode & 0o777, 0o600)
         self.assertEqual(state["schema_version"], installer_module.INSTALL_STATE_VERSION)
-        self.assertEqual(state["runtime_version"], "0.1.0")
+        self.assertEqual(state["runtime_version"], __version__)
         self.assertNotIn("payload", state_text.lower())
         self.assertEqual(state["computer_use"]["bundle_id"], "com.openai.sky.CUAService.cli")
 
