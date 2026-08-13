@@ -34,6 +34,7 @@ jobs:
       - run: python -m pip install --upgrade build twine
       - run: python -m build
       - run: python -m twine check dist/*
+      - run: python scripts/verify_distribution_contents.py dist/*.whl dist/*.tar.gz
       - name: Verify built wheel outside source checkout
         shell: bash
         run: |
@@ -57,15 +58,33 @@ jobs:
       contents: write
       id-token: write
     steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
       - uses: actions/download-artifact@v4
         with:
           name: python-package
           path: dist/
-      - name: Attach the exact distribution files to the GitHub Release
+      - name: Idempotently attach exact files to the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: >-
-          gh release upload "$RELEASE_TAG" dist/*.whl dist/*.tar.gz
-          --repo "${{ github.repository }}" --clobber
+          python scripts/verify_release_integrity.py
+          --repository "${{ github.repository }}"
+          --tag "$RELEASE_TAG"
+          --dist dist
+          --ensure-github-assets
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+      - name: Verify GitHub Release and PyPI hashes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: >-
+          python scripts/verify_release_integrity.py
+          --repository "${{ github.repository }}"
+          --tag "$RELEASE_TAG"
+          --dist dist

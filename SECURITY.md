@@ -7,8 +7,12 @@
 
 ## 报告安全漏洞
 
-如果怀疑存在漏洞或凭据泄露，请勿创建公开 Issue。请使用本仓库的 GitHub 私密漏洞报告功能，
+如果怀疑存在漏洞或凭据泄露，请勿创建公开 Issue。请使用本仓库已启用的
+[GitHub 私密漏洞报告功能](https://github.com/guangcodes/codex-notify/security/advisories/new)，
 并提供受影响版本、复现步骤、影响范围，以及可选的缓解建议。
+
+仓库管理员已于 2026-08-13 通过 GitHub API 确认该功能处于启用状态。若上述入口不可用，
+请勿改用公开 Issue 披露漏洞细节；等待仓库管理员恢复私密报告入口。
 
 报告中不得包含真实飞书 Webhook、签名密钥、Keychain 值、Transcript 或 Codex 私有数据。
 如果凭据已经暴露，请先撤销或轮换凭据。

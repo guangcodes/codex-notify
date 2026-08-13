@@ -5,6 +5,10 @@ codex-notify 有意保持狭窄的支持契约：macOS、Python 3.11+、Codex Co
 取代 Computer Use 的所有权、推断私有 Turn 关系、读取 Transcript，或削弱安装器的
 失败关闭检查。
 
+引入新的 Python 依赖、外部服务、第三方源码、二进制文件、字体、图像或数据时，必须同时
+说明运行时必要性，更新 `pyproject.toml`、README 的依赖表和 `THIRD_PARTY_NOTICES.md`，
+并提交上游许可证要求的版权与许可文本。不要把只用于开发或 CI 的工具声明为用户运行依赖。
+
 ## 本地开发与验证
 
 ```bash

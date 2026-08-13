@@ -1,0 +1,35 @@
+name: Release integrity
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 要复核的 GitHub Release tag
+        required: true
+        default: v0.1.0
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Download exact GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: gh release download "$RELEASE_TAG" --repo "${{ github.repository }}" --dir dist
+      - name: Compare GitHub Release and PyPI hashes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: >-
+          python scripts/verify_release_integrity.py
+          --repository "${{ github.repository }}"
+          --tag "$RELEASE_TAG"
+          --dist dist
