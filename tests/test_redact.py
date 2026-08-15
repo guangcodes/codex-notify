@@ -74,6 +74,16 @@ class SafeSummaryTests(unittest.TestCase):
         pgp_private_key_marker = "".join(
             ("-----BEGIN PGP ", "PRIVATE KEY ", "BLOCK-----")
         )
+        stripe_api_key = "".join(("sk_", "live_", "abcdefghijklmnopqrstuvwxyz"))
+        stripe_restricted_key = "".join(
+            ("rk_", "live_", "abcdefghijklmnopqrstuvwxyz")
+        )
+        slack_bot_token = "".join(
+            ("xoxb-", "123456789012-", "123456789012-", "abcdefghijklmnopqrstuvwxyz")
+        )
+        stripe_webhook_secret = "".join(
+            ("whsec_", "abcdefghijklmnopqrstuvwxyz", "123456")
+        )
         cases = [
             "Authorization: Bearer abcdefghijklmnop",
             "api_key=super-secret-value",
@@ -82,8 +92,8 @@ class SafeSummaryTests(unittest.TestCase):
             "codex run --token=fake-cli-token-value",
             "codex run --api-key=fake-cli-key-value",
             "sk-proj-abcdefghijklmnop",
-            "sk_live_abcdefghijklmnopqrstuvwxyz",
-            "rk_live_abcdefghijklmnopqrstuvwxyz",
+            stripe_api_key,
+            stripe_restricted_key,
             "https://open.feishu.cn/open-apis/bot/v2/hook/secret-hook-id",
             private_key_marker,
             pgp_private_key_marker,
@@ -91,8 +101,8 @@ class SafeSummaryTests(unittest.TestCase):
             "AKIAIOSFODNN7EXAMPLE",
             "ghp_abcdefghijklmnopqrstuvwxyz1234567890",
             "github_pat_11AA0_exampletoken1234567890",
-            "xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwxyz",
-            "whsec_abcdefghijklmnopqrstuvwxyz123456",
+            slack_bot_token,
+            stripe_webhook_secret,
             "glpat-abcdefghijklmnopqrstuvwxyz123456",
             "AIzaSyD-fakeCredentialValue1234567890",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.fakeSignatureValue",
