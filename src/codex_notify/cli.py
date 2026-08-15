@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import __version__
+from .app_server_metadata import find_bundled_codex
 from .computer_use import inspect_computer_use
 from .db import NotificationStore
 from .feishu import validate_webhook_url
@@ -113,6 +114,8 @@ def _status(store: NotificationStore) -> None:
     print(f"运行中且结束时会通知的 Turn：{snapshot['active_turns']}")
     print(f"待发送/重试：{snapshot['pending']}")
     print(f"待分类确认：{snapshot['pending_decisions']}")
+    print(f"无法确认且已静默：{snapshot.get('unverified_turns', 0)}")
+    print(f"关系冲突：{snapshot.get('conflict_relations', 0)}")
     print(f"永久失败：{snapshot['dead']}")
     print(f"最近成功：{_format_timestamp(snapshot['last_delivery_at'])}")
     print(f"最近错误：{snapshot['last_error'] or '无'}")
@@ -170,6 +173,18 @@ def _hook_handler_ok(
 def _doctor(paths: AppPaths) -> int:
     checks: list[tuple[str, bool, str]] = []
     checks.append(("macOS", platform.system() == "Darwin", platform.system()))
+    bundled_codex = find_bundled_codex()
+    checks.append(
+        (
+            "App Server 元数据优化",
+            True,
+            (
+                f"可用：{bundled_codex}"
+                if bundled_codex is not None
+                else "已降级：未找到 ChatGPT Desktop bundled Codex；通知主链不受影响"
+            ),
+        )
+    )
     runner_ok = paths.runner.is_file() and os.access(paths.runner, os.X_OK)
     package_dir = paths.library_dir / "codex_notify"
     library_ok = package_dir.is_dir() and (package_dir / "__init__.py").is_file()
@@ -425,7 +440,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "on":
             store.set_enabled(True)
-            print("通知已开启：后续每个 Codex Turn 开始和结束都会推送。")
+            print("通知已开启：后续已确认的用户根 Turn 会推送开始和结束。")
         elif args.command == "off":
             store.set_enabled(False, immediate=args.now)
             if args.now:

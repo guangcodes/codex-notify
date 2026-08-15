@@ -19,8 +19,12 @@ codex-notify 不提供远程控制能力，也不替代 ChatGPT Remote。它只�
 ```text
 SessionStart ────────────────→ 只记录会话生命周期和上下文压缩来源
 UserPromptSubmit ────────────→ PENDING_ROOT_CANDIDATE（统一等待 5 秒）
-SubagentStart/SubagentStop ──→ 只记录官方父 Turn → 子代理 agent_id 关系
+SubagentStart/SubagentStop ──→ 保存原始 Hook 身份并推导唯一活动父 Turn
 agent-turn-complete ─────────→ 唯一权威完成事件
+                                  ↓
+                              一次性 metadata-only App Server 校准
+                                  ↓
+                              根完成等待 5 秒并合并已确认子结果
                                   ↓
                               SQLite 发件队列
                                   ↓
@@ -37,15 +41,17 @@ agent-turn-complete ─────────→ 唯一权威完成事件
 - `lifecycle`：`RUNNING`、`COMPLETED`
 - 抑制状态：`suppressed` 与可空的 `suppression_reason`
 
-所有具有有效 `session_id + turn_id` 的 `UserPromptSubmit` 都先进入相同的 5 秒窗口。当前公开 Codex 契约没有把子代理 Hook 的 `agent_id` 连接到子 Turn 的 `UserPromptSubmit.session_id` 或 `agent-turn-complete.thread-id`，因此工具不会假设这些字段相等。窗口结束后，没有可直接证明的内部关系就按失败开放策略转为 `NOTIFIABLE_ROOT`。
+所有具有有效 `session_id + turn_id` 的 `UserPromptSubmit` 都先进入相同的 5 秒窗口。异步 worker 只使用 ChatGPT Desktop 内置的 Codex 启动一次性 App Server：优先调用 `thread/read(includeTurns=false)`；当 Hook `session_id` 不能直接读取时，使用 `thread/list(useStateDbOnly=true)` 在交互 Thread 中做唯一 ID 候选映射，再用 `thread/read(includeTurns=false)` 校准，并通过 `thread/turns/list(itemsView="notLoaded")` 确认 Hook `turn_id` 确实属于该 Thread。代码仅解析身份、来源和时间元数据；Turn Items 必须为空，列表中的 `preview` 不会保存或转发。只有精确 Turn 归属成立、`parentThreadId=null` 且来源为 `vscode`、`appServer` 或 `cli` 时才转为 `NOTIFIABLE_ROOT`；查询缺失、失败、超时、字段未知或证据冲突时保持静默。
 
-`NOTIFIABLE_ROOT` 只表示“按照当前策略应该通知”，不表示已经证明提示词由用户直接输入。内部审查器、守护任务、上下文压缩或子代理 Turn 可能产生少量误报；这是“尽量不漏用户根 Turn”优先级下的明确取舍。
+`SubagentStart` 的 Hook `turn_id` 只按原始字段保存，不直接当作父 Turn。仅当父 Thread 当时恰好有一个运行中 Turn，且后续子事件的 Thread ID 精确等于 `agent_id`、Turn ID 精确等于该 Hook `turn_id`、时间顺序成立且关系无冲突时，才确认 `CONFIRMED_CHILD`。单凭时间、`agent_id` 或父 Thread 均不足以合并。
 
-完成处理只使用精确的 `(session/thread id, turn_id)`，永不按相同 `turn_id` 跨会话回退。缺失可发送启动事件时，如果完成事件身份有效、通知已开启且没有明确内部证据，会发送独立完成通知，并标注“未观测到对应启动事件”。不会补发或伪造启动。
+完成处理只使用精确的 `(session/thread id, turn_id)`，永不按相同 `turn_id` 跨会话回退。`UNKNOWN`、`UNVERIFIED` 和 `CONFLICT` 均不通知、不合并，也不为缺少已确认来源的完成事件发送独立通知。
+
+根 Turn 完成后等待固定 5 秒，以父 Turn 的 `last-assistant-message` 为主结果，并按 `SubagentStart.started_at` 合并已完成的确认子结果。子结果使用确定性脱敏与截断，最多 8 项、每项最多 200 字；窗口后到达的结果不补发。整个过程不调用模型生成摘要。
 
 ## 开关
 
-- `codex-notify on`：允许新候选在 5 秒后生成启动事件，也允许合规的独立完成事件。
+- `codex-notify on`：允许新候选在证据确认后生成根启动事件和配对完成事件。
 - `codex-notify off`：阻止新的启动事件；已经生成启动事件的 Turn 仍可发送配对完成。
 - `codex-notify off --now`：在发送锁内等待当前投递结束，然后永久抑制运行中 Turn、pending 候选和未发送队列。重新 `on` 不会恢复这些 Turn。
 - `codex-notify test`：显式测试操作，不受 Turn 分类和 `off --now` 影响。
@@ -208,7 +214,7 @@ python3 ~/.codex/codex-notify/runner.py uninstall
 
 ## 隐私与本地数据
 
-发送到飞书的消息包含项目名称、用户任务摘要、Codex 结果摘要、时间、耗时、短 Turn ID 和事件 ID。摘要在进入 SQLite 前经过敏感格式检测、整段替换和长度截断，但正则脱敏不能保证识别所有业务机密；不要在高敏感项目中启用通知。
+发送到飞书的消息包含项目名称、用户任务摘要、父 Turn 最终结果、已确认子 Turn 的结构化结果、时间、耗时、短 Turn ID 和事件 ID。摘要在进入 SQLite 前经过敏感格式检测、整段替换和长度截断，但正则脱敏不能保证识别所有业务机密；不要在高敏感项目中启用通知。App Server 的响应、preview、prompt、cwd 和消息 Item 不会保存。
 
 飞书 Webhook 和签名密钥只保存在当前用户的 macOS Keychain。运行数据位于 `~/.codex/codex-notify/`，SQLite 与日志仅对当前用户开放。发件队列最长保留 24 小时；飞书已接收而本地未收到确认时，重试可能产生相同事件 ID 的重复消息。普通卸载保留数据，只有 `--purge` 删除运行数据。
 
@@ -229,7 +235,8 @@ python3 -m build
 ## 已知边界
 
 - `agent-turn-complete` 是唯一完成来源；没有真实完成事件时不会伪造完成。
-- 当前公开事件无法稳定连接子代理 `agent_id` 与子 Turn 身份，因此完整内部 Turn 抑制不在当前能力声明内。
+- 父子关系是受约束推导，只优化能够由唯一活动父 Turn 和精确子身份共同确认的情况；无法确认时宁可静默。
+- metadata-only 校准依赖 ChatGPT Desktop bundled Codex 的实验性 App Server 契约；缺失、漂移或失败只会降低通知覆盖率，不影响 Codex Desktop。
 - `SessionStart source=compact` 只记录会话信息，不建立父子边。
 - 飞书若已经接收请求但本地未收到确认，重试可能产生带相同事件 ID 的重复消息。
 - 当前实现依赖 macOS Keychain 和 LaunchAgent。

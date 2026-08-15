@@ -5,11 +5,13 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 
+from .app_server_metadata import ThreadMetadata, read_pending_metadata
 from .constants import DEFAULT_BATCH_SIZE, OUTBOX_RETENTION_SECONDS, RETRY_DELAYS_SECONDS
 from .db import NotificationStore
 from .feishu import DeliveryError, FeishuClient
 from .keychain import load_credentials
 from .messages import render_message
+from .paths import AppPaths
 
 
 def _retry_delay(attempts: int) -> int:
@@ -23,9 +25,37 @@ def run_once(
     client_factory: Callable[[], FeishuClient] | None = None,
     now: float | None = None,
     event_key: str | None = None,
+    metadata_reader: Callable[
+        [AppPaths, list[str], dict[str, str]], dict[str, ThreadMetadata] | None
+    ]
+    | None = None,
 ) -> int:
     store = store or NotificationStore()
-    store.finalize_pending(now=now)
+    metadata_turns: list[tuple[str, str]] | None = None
+    if event_key is None and store.is_enabled():
+        metadata_turns = store.pending_metadata_turns(now=now, limit=1)
+        metadata_session_ids = [session_id for session_id, _turn_id in metadata_turns]
+        metadata_turn_ids = dict(metadata_turns)
+        if metadata_turns:
+            try:
+                reader = metadata_reader or read_pending_metadata
+                metadata = reader(store.paths, metadata_session_ids, metadata_turn_ids)
+            except Exception:
+                metadata = {}
+            if metadata is None:
+                metadata_turns = []
+            else:
+                for session_id, item in metadata.items():
+                    store.record_thread_metadata(
+                        session_id,
+                        turn_id=metadata_turn_ids.get(session_id),
+                        parent_thread_id=item.parent_thread_id,
+                        source_kind=item.source_kind,
+                        now=now,
+                    )
+    if event_key is None:
+        store.finalize_pending(now=now, turn_keys=metadata_turns)
+        store.finalize_aggregations(now=now)
     now = now if now is not None else time.time()
     items = (
         store.claim_test(event_key, now=now)

@@ -43,12 +43,28 @@ def render_message(event_type: str, payload: dict[str, Any]) -> str:
             if payload.get("incomplete_lifecycle")
             else ""
         )
+        children = payload.get("child_results")
+        child_block = ""
+        if isinstance(children, list) and children:
+            lines = []
+            for child in children:
+                if not isinstance(child, dict):
+                    continue
+                agent_type = str(child.get("agent_type") or "subagent")
+                child_summary = str(child.get("summary") or "（无可用结果）")
+                lines.append(f"- {agent_type}：{child_summary}")
+            omitted = int(payload.get("omitted_child_results") or 0)
+            if omitted > 0:
+                lines.append(f"- 另有 {omitted} 个已确认子任务未展开")
+            if lines:
+                child_block = "\n子任务结果：\n" + "\n".join(lines) + "\n"
         return (
             "✅ Codex Turn 结束\n"
             f"项目：{project}\n"
             f"时间：{_clock(occurred_at)}\n"
             f"耗时：{duration}\n"
             f"结果：{summary}\n"
+            f"{child_block}"
             f"Turn：{short_turn_id}\n"
             f"事件：{event_id}"
             f"{lifecycle_note}"
