@@ -21,7 +21,7 @@ class PublicTurnPolicyTests(unittest.TestCase):
                 "FROM outbox ORDER BY id"
             ).fetchall()
 
-    def test_every_valid_prompt_uses_the_same_five_second_window(self):
+    def test_metadata_confirmed_root_is_notified_after_window(self):
         event = HookEvent("session", "turn", "/work/demo", prompt="ordinary prompt")
 
         self.assertFalse(self.store.record_start(event, now=10))
@@ -33,13 +33,18 @@ class PublicTurnPolicyTests(unittest.TestCase):
         self.assertEqual(self._events(), [])
 
         self.assertEqual(self.store.finalize_pending(now=14.999), 0)
+        self.assertTrue(
+            self.store.record_thread_metadata(
+                "session", parent_thread_id=None, source_kind="vscode", now=14
+            )
+        )
         self.assertEqual(self.store.finalize_pending(now=15), 1)
         with self.store.managed_connection() as connection:
             turn = connection.execute("SELECT * FROM turns").fetchone()
         self.assertEqual(turn["classification"], "NOTIFIABLE_ROOT")
         self.assertEqual([row["event_type"] for row in self._events()], ["started"])
 
-    def test_prompt_shape_never_proves_internal_origin(self):
+    def test_unknown_prompt_is_silent_after_window(self):
         prompt = (
             "# Overview\nGenerate 0 to 3 hyperpersonalized suggestions for what this "
             "user can do with Codex in this local project: demo.\n\n# Rules\n"
@@ -47,11 +52,18 @@ class PublicTurnPolicyTests(unittest.TestCase):
         )
         self.store.record_start(HookEvent("session", "turn", "", prompt=prompt), now=10)
         self.assertEqual(self.store.finalize_pending(now=15), 1)
-        self.assertEqual([row["event_type"] for row in self._events()], ["started"])
+        with self.store.managed_connection() as connection:
+            classification = connection.execute("SELECT classification FROM turns").fetchone()[0]
+        self.assertEqual(classification, "UNVERIFIED")
+        self.assertEqual(self._events(), [])
 
-    def test_agent_id_is_not_assumed_to_equal_child_session_id(self):
+    def test_exact_child_identity_and_unique_parent_are_merged_not_notified(self):
+        self.store.record_start(
+            HookEvent("parent-session", "root-turn", "/work/demo", prompt="root"),
+            now=8,
+        )
         self.store.record_subagent_start(
-            SubagentEvent("child-session", "review", "parent-session", "parent-turn"),
+            SubagentEvent("child-session", "review", "parent-session", "child-turn"),
             now=9,
         )
         self.store.record_start(
@@ -64,8 +76,8 @@ class PublicTurnPolicyTests(unittest.TestCase):
             turn = connection.execute(
                 "SELECT classification FROM turns WHERE session_id='child-session'"
             ).fetchone()
-        self.assertEqual(turn["classification"], "NOTIFIABLE_ROOT")
-        self.assertEqual([row["event_type"] for row in self._events()], ["started"])
+        self.assertEqual(turn["classification"], "CONFIRMED_CHILD")
+        self.assertEqual(self._events(), [])
 
     def test_external_relation_cannot_consume_exact_parent_completion(self):
         parent = HookEvent("parent-session", "shared-turn", "/work/demo", prompt="root")
@@ -146,7 +158,7 @@ class PublicTurnPolicyTests(unittest.TestCase):
         self.store.record_start(
             HookEvent("parent-session", "shared-turn", "", prompt="root"), now=10
         )
-        self.assertTrue(
+        self.assertFalse(
             self.store.record_completion(
                 HookEvent(
                     "child-session",
@@ -183,6 +195,9 @@ class PublicTurnPolicyTests(unittest.TestCase):
 
     def test_event_key_is_the_exact_identity_tuple_encoding(self):
         self.store.record_start(HookEvent("s:1", "t:1", "", prompt="work"), now=10)
+        self.store.record_thread_metadata(
+            "s:1", parent_thread_id=None, source_kind="vscode", now=14
+        )
         self.store.finalize_pending(now=15)
         row = self._events()[0]
         with self.store.managed_connection() as connection:

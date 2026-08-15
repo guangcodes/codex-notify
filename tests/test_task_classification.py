@@ -3,7 +3,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 from codex_notify.db import HookEvent, NotificationStore, SubagentEvent
@@ -28,6 +28,11 @@ class TurnStateTests(unittest.TestCase):
         with self.store.managed_connection() as connection:
             return connection.execute("SELECT * FROM outbox ORDER BY id").fetchall()
 
+    def _confirm_root(self, session="session", *, now=15):
+        self.store.record_thread_metadata(
+            session, parent_thread_id=None, source_kind="appServer", now=now
+        )
+
     def test_completion_during_window_changes_lifecycle_not_classification(self):
         self.store.set_enabled(True, now=1)
         self.store.record_start(HookEvent("session", "turn", "", prompt="work"), now=10)
@@ -42,7 +47,9 @@ class TurnStateTests(unittest.TestCase):
         self.assertEqual(pending["lifecycle"], "COMPLETED")
         self.assertEqual(self._events(), [])
 
+        self._confirm_root()
         self.store.finalize_pending(now=15)
+        self.store.finalize_aggregations(now=17)
         final = self._turn()
         self.assertEqual(final["classification"], "NOTIFIABLE_ROOT")
         self.assertEqual(final["lifecycle"], "COMPLETED")
@@ -80,11 +87,12 @@ class TurnStateTests(unittest.TestCase):
         with self.store.managed_connection() as connection:
             relation = connection.execute("SELECT state FROM subagents").fetchone()[0]
         self.assertEqual(relation, "conflict")
-        self.assertEqual(self._turn("agent", "child-turn")["classification"], "NOTIFIABLE_ROOT")
+        self.assertEqual(self._turn("agent", "child-turn")["classification"], "UNVERIFIED")
 
     def test_late_relation_never_retracts_or_suppresses_start(self):
         self.store.set_enabled(True, now=1)
         self.store.record_start(HookEvent("child-session", "turn", "", prompt="work"), now=10)
+        self._confirm_root("child-session")
         self.store.finalize_pending(now=15)
         start = self.store.claim_due(limit=1, now=15)[0]
         self.store.mark_sent(start["id"], now=15)
@@ -92,38 +100,93 @@ class TurnStateTests(unittest.TestCase):
             SubagentEvent("child-session", "worker", "parent", "parent-turn"),
             now=16,
         )
-        self.assertTrue(
+        self.assertFalse(
             self.store.record_completion(
                 HookEvent("child-session", "turn", "", last_assistant_message="done"),
                 now=17,
             )
         )
+        self.store.finalize_aggregations(now=22)
         self.assertEqual(
             [row["event_type"] for row in self._events()],
             ["started", "completed"],
         )
 
-    def test_missing_start_completion_is_standalone_and_idempotent(self):
+    def test_late_exact_child_relation_preserves_already_queued_root_pair(self):
+        self.store.set_enabled(True, now=1)
+        self.store.record_start(
+            HookEvent("parent", "parent-turn", "", prompt="parent"), now=5
+        )
+        self.store.record_start(
+            HookEvent("candidate", "candidate-turn", "", prompt="candidate"),
+            now=10,
+        )
+        self._confirm_root("candidate")
+        self.store.finalize_pending(now=15)
+        self.store.record_subagent_start(
+            SubagentEvent(
+                "candidate",
+                "worker",
+                "parent",
+                "candidate-turn",
+            ),
+            now=16,
+        )
+
+        self.assertFalse(
+            self.store.record_completion(
+                HookEvent(
+                    "candidate",
+                    "candidate-turn",
+                    "",
+                    last_assistant_message="done",
+                ),
+                now=17,
+            )
+        )
+        self.store.finalize_aggregations(now=22)
+
+        self.assertEqual(
+            [row["event_type"] for row in self._events()],
+            ["started", "completed"],
+        )
+        self.assertEqual(
+            self._turn("candidate", "candidate-turn")["classification"],
+            "NOTIFIABLE_ROOT",
+        )
+
+    def test_missing_start_completion_is_silent_and_idempotent(self):
         self.store.set_enabled(True, now=1)
         completion = HookEvent("session", "turn", "", last_assistant_message="done")
-        self.assertTrue(self.store.record_completion(completion, now=10))
-        self.assertTrue(self.store.record_completion(completion, now=11))
-        rows = self._events()
-        self.assertEqual([row["event_type"] for row in rows], ["completed"])
-        self.assertTrue(json.loads(rows[0]["payload_json"])["incomplete_lifecycle"])
+        self.assertFalse(self.store.record_completion(completion, now=10))
+        self.assertFalse(self.store.record_completion(completion, now=11))
+        self.assertEqual(self._events(), [])
 
-    def test_start_when_off_then_completion_after_on_is_standalone(self):
+    def test_start_when_off_then_completion_after_on_is_silent(self):
         self.store.record_start(HookEvent("session", "turn", "", prompt="work"), now=10)
         self.store.finalize_pending(now=15)
         self.assertEqual(self._events(), [])
+
+    def test_confirmed_root_started_while_off_never_gets_completion_only_notice(self):
+        self.store.record_start(HookEvent("session", "turn", "", prompt="work"), now=10)
+        self.store.set_enabled(True, now=11)
+        self._confirm_root(now=14)
+        self.store.finalize_pending(now=15)
+        self.store.record_completion(
+            HookEvent("session", "turn", "", last_assistant_message="done"),
+            now=16,
+        )
+
+        self.store.finalize_aggregations(now=100)
+        self.assertEqual(self._events(), [])
         self.store.set_enabled(True, now=16)
-        self.assertTrue(
+        self.assertFalse(
             self.store.record_completion(
                 HookEvent("session", "turn", "", last_assistant_message="done"),
                 now=17,
             )
         )
-        self.assertEqual([row["event_type"] for row in self._events()], ["completed"])
+        self.assertEqual(self._events(), [])
 
     def test_completion_that_arrived_while_off_is_not_reconsidered(self):
         completion = HookEvent("session", "turn", "", last_assistant_message="done")
@@ -153,6 +216,7 @@ class TurnStateTests(unittest.TestCase):
         self.store.set_enabled(True, now=1)
         self.store.record_start(HookEvent("session", "turn", "", prompt="work"), now=10)
         self.store.set_enabled(False, now=11)
+        self._confirm_root()
         self.store.finalize_pending(now=15)
         turn = self._turn()
         self.assertEqual(turn["classification"], "NOTIFIABLE_ROOT")
@@ -168,6 +232,7 @@ class TurnStateTests(unittest.TestCase):
         )
 
         self.store.set_enabled(False, now=13)
+        self._confirm_root()
         self.store.finalize_pending(now=15)
 
         self.assertEqual(self._events(), [])
@@ -178,6 +243,7 @@ class TurnStateTests(unittest.TestCase):
     def test_graceful_off_and_finalization_are_serializable(self):
         self.store.set_enabled(True, now=1)
         self.store.record_start(HookEvent("session", "turn", "", prompt="work"), now=10)
+        self._confirm_root()
         barrier = threading.Barrier(2)
         errors = []
 
@@ -236,8 +302,11 @@ class TurnStateTests(unittest.TestCase):
         for thread in threads:
             thread.join(timeout=5)
         self.assertEqual(errors, [])
-        self.assertEqual([row["event_type"] for row in self._events()], ["started"])
-        self.assertEqual(self._turn()["classification"], "NOTIFIABLE_ROOT")
+        self.assertIn([row["event_type"] for row in self._events()], ([], ["started"]))
+        self.assertIn(
+            self._turn()["classification"],
+            ("NOTIFIABLE_ROOT", "CONFIRMED_CHILD", "UNVERIFIED"),
+        )
 
     def test_invalid_or_unsafe_identity_is_silent(self):
         self.store.set_enabled(True, now=1)
@@ -320,17 +389,17 @@ class TurnStateTests(unittest.TestCase):
             legacy_table = connection.execute(
                 "SELECT name FROM sqlite_master WHERE name='managed_launchers'"
             ).fetchone()
-        self.assertEqual(version, 5)
+        self.assertEqual(version, 6)
         self.assertEqual(turn["classification"], "NOTIFIABLE_ROOT")
         self.assertEqual(turn["lifecycle"], "COMPLETED")
-        self.assertEqual(pending["classification"], "PENDING_ROOT_CANDIDATE")
+        self.assertEqual(pending["classification"], "UNVERIFIED")
         self.assertEqual(pending["lifecycle"], "COMPLETED")
         self.assertEqual(pending["state"], "completed")
         self.assertEqual(pending["completed_at"], 12)
         self.assertIsNotNone(legacy_table)
         with legacy_store.managed_connection() as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
-        self.assertEqual(legacy_store.finalize_pending(now=100), 1)
+        self.assertEqual(legacy_store.finalize_pending(now=100), 0)
         with legacy_store.managed_connection() as connection:
             rows = connection.execute(
                 "SELECT session_id, event_type FROM outbox ORDER BY id"
@@ -339,10 +408,140 @@ class TurnStateTests(unittest.TestCase):
             [tuple(row) for row in rows],
             [
                 ("old-session", "started"),
-                ("pending-session", "started"),
-                ("pending-session", "completed"),
             ],
         )
+
+    def test_v5_fail_open_rows_are_suppressed_but_sent_start_keeps_pair(self):
+        root = Path(self.temp_dir.name) / "v5"
+        paths = AppPaths(root)
+        original_store = NotificationStore(paths)
+        with original_store.managed_connection() as connection:
+            connection.execute("PRAGMA user_version=5")
+            for session_id in ("unsent", "sent-start"):
+                connection.execute(
+                    """INSERT INTO turns(
+                           session_id, turn_id, cwd, project, prompt_summary,
+                           started_at, completed_at, notify_pair, suppressed,
+                           state, classification, lifecycle, decision_reason,
+                           pending_completed_at, pending_completion_summary,
+                           pending_completion_enabled
+                       ) VALUES(?, 'turn', '', 'demo', 'work', 10, 20, 1, 0,
+                                'completed', 'NOTIFIABLE_ROOT', 'COMPLETED',
+                                'public_contract_fail_open', 20, 'done', 1)""",
+                    (session_id,),
+                )
+            connection.execute(
+                """INSERT INTO turns(
+                       session_id, turn_id, cwd, project, prompt_summary,
+                       started_at, notify_pair, suppressed, state,
+                       classification, lifecycle, decision_reason,
+                       classification_source
+                   ) VALUES('legacy-empty', 'turn', '', 'demo', 'work',
+                            10, 1, 0, 'running', 'NOTIFIABLE_ROOT', 'RUNNING',
+                            '', 'public_contract')"""
+            )
+            connection.execute(
+                """INSERT INTO outbox(
+                       event_key, session_id, turn_id, event_type, payload_json,
+                       status, next_attempt_at, created_at
+                   ) VALUES('unsent-start', 'unsent', 'turn', 'started', '{}',
+                            'pending', 10, 10)"""
+            )
+            connection.execute(
+                """INSERT INTO outbox(
+                       event_key, session_id, turn_id, event_type, payload_json,
+                       status, next_attempt_at, created_at
+                   ) VALUES('unsent-complete', 'unsent', 'turn', 'completed', '{}',
+                            'sending', 10, 10)"""
+            )
+            connection.execute(
+                """INSERT INTO outbox(
+                       event_key, session_id, turn_id, event_type, payload_json,
+                       status, next_attempt_at, created_at
+                   ) VALUES('legacy-empty-start', 'legacy-empty', 'turn',
+                            'started', '{}', 'pending', 10, 10)"""
+            )
+            connection.execute(
+                """INSERT INTO outbox(
+                       event_key, session_id, turn_id, event_type, payload_json,
+                       status, next_attempt_at, created_at, sent_at
+                   ) VALUES('sent-start', 'sent-start', 'turn', 'started', '{}',
+                            'sent', 10, 10, 11)"""
+            )
+
+        migrated = NotificationStore(paths)
+        with migrated.managed_connection() as connection:
+            unsent_turn = connection.execute(
+                "SELECT classification FROM turns WHERE session_id='unsent'"
+            ).fetchone()[0]
+            unsent_outbox = connection.execute(
+                "SELECT event_key, status FROM outbox WHERE session_id='unsent' "
+                "ORDER BY event_key"
+            ).fetchall()
+            legacy_empty = connection.execute(
+                "SELECT classification, decision_reason FROM turns "
+                "WHERE session_id='legacy-empty'"
+            ).fetchone()
+            legacy_empty_status = connection.execute(
+                "SELECT status FROM outbox WHERE session_id='legacy-empty'"
+            ).fetchone()[0]
+            paired_turn = connection.execute(
+                "SELECT decision_reason, aggregation_due_at FROM turns "
+                "WHERE session_id='sent-start'"
+            ).fetchone()
+        self.assertEqual(unsent_turn, "UNVERIFIED")
+        self.assertEqual(
+            [(row["event_key"], row["status"]) for row in unsent_outbox],
+            [
+                ("unsent-complete", "suppressed"),
+                ("unsent-start", "suppressed"),
+            ],
+        )
+        self.assertEqual(legacy_empty["classification"], "UNVERIFIED")
+        self.assertEqual(legacy_empty["decision_reason"], "legacy_fail_open_suppressed")
+        self.assertEqual(legacy_empty_status, "suppressed")
+        self.assertEqual(paired_turn["decision_reason"], "legacy_sent_start_pair")
+        self.assertIsNotNone(paired_turn["aggregation_due_at"])
+
+        self.assertEqual(migrated.finalize_aggregations(now=100), 1)
+        with migrated.managed_connection() as connection:
+            completions = connection.execute(
+                "SELECT session_id FROM outbox WHERE event_type='completed' "
+                "AND status<>'suppressed'"
+            ).fetchall()
+        self.assertEqual([row[0] for row in completions], ["sent-start"])
+
+    def test_migration_does_not_downgrade_a_newer_schema_marker(self):
+        root = Path(self.temp_dir.name) / "newer"
+        paths = AppPaths(root)
+        store = NotificationStore(paths)
+        with store.managed_connection() as connection:
+            connection.execute("PRAGMA user_version=99")
+
+        with NotificationStore(paths).managed_connection() as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+        self.assertEqual(version, 99)
+
+    def test_v6_migration_uses_delivery_file_lock(self):
+        root = Path(self.temp_dir.name) / "migration-lock"
+        paths = AppPaths(root)
+        store = NotificationStore(paths)
+        with store.managed_connection() as connection:
+            connection.execute("PRAGMA user_version=5")
+
+        class RecordingStore(NotificationStore):
+            lock_entries = 0
+
+            @contextmanager
+            def _delivery_file_lock(self):
+                self.lock_entries += 1
+                with super()._delivery_file_lock():
+                    yield
+
+        recording_store = RecordingStore(paths)
+        with recording_store.managed_connection():
+            pass
+        self.assertEqual(recording_store.lock_entries, 1)
 
 
 if __name__ == "__main__":

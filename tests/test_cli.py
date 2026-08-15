@@ -124,6 +124,20 @@ class CliTests(unittest.TestCase):
 
         run_once.assert_called_once_with(store, event_key="target-event")
 
+    def test_on_command_only_promises_confirmed_root_notifications(self):
+        store = Mock()
+        output = io.StringIO()
+
+        with (
+            patch("codex_notify.cli.NotificationStore", return_value=store),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(main(["on"]), 0)
+
+        store.set_enabled.assert_called_once_with(True)
+        self.assertIn("已确认的用户根 Turn", output.getvalue())
+        self.assertNotIn("每个 Codex Turn", output.getvalue())
+
     def test_doctor_rejects_marker_strings_and_unloaded_launch_agent(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

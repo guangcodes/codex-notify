@@ -22,7 +22,16 @@ class NotificationStoreTests(unittest.TestCase):
     def _start(self, *, now=100, finalize=True):
         self.store.record_start(self.event, now=now)
         if finalize:
+            self.store.record_thread_metadata(
+                self.event.session_id,
+                parent_thread_id=None,
+                source_kind="appServer",
+                now=now + 5,
+            )
             self.store.finalize_pending(now=now + 5)
+
+    def _finish_aggregation(self, *, now):
+        self.store.finalize_aggregations(now=now)
 
     def test_default_is_off_and_disabled_turn_never_gets_completion(self):
         self.assertFalse(self.store.is_enabled())
@@ -35,32 +44,31 @@ class NotificationStoreTests(unittest.TestCase):
         )
         self.assertEqual(self.store.status_snapshot()["pending"], 0)
 
-    def test_enabled_completion_without_start_queues_standalone(self):
+    def test_enabled_completion_without_start_is_silent(self):
         self.store.set_enabled(True, now=1)
-        self.assertTrue(
+        self.assertFalse(
             self.store.record_completion(
                 HookEvent("missing", "turn", "", last_assistant_message="done"),
                 now=10,
             )
         )
-        claimed = self.store.claim_due(limit=10, now=10)
-        self.assertEqual([item["event_type"] for item in claimed], ["completed"])
-        self.assertTrue(claimed[0]["payload"]["incomplete_lifecycle"])
+        self.assertEqual(self.store.claim_due(limit=10, now=10), [])
 
     def test_enabled_turn_queues_exactly_one_ordered_pair(self):
         self.store.set_enabled(True, now=1)
         self._start()
         self._start(now=101)
         completion = HookEvent("session-1", "turn-1", "", last_assistant_message="done")
-        self.assertTrue(self.store.record_completion(completion, now=120))
-        self.assertTrue(self.store.record_completion(completion, now=121))
+        self.assertFalse(self.store.record_completion(completion, now=120))
+        self.assertFalse(self.store.record_completion(completion, now=121))
+        self._finish_aggregation(now=125)
         with self.store.managed_connection() as connection:
             rows = connection.execute("SELECT event_type FROM outbox ORDER BY id").fetchall()
         self.assertEqual([row["event_type"] for row in rows], ["started", "completed"])
         first = self.store.claim_due(limit=10, now=120)
         self.assertEqual([item["event_type"] for item in first], ["started"])
         self.store.mark_sent(first[0]["id"], now=120)
-        second = self.store.claim_due(limit=10, now=121)
+        second = self.store.claim_due(limit=10, now=125)
         self.assertEqual([item["event_type"] for item in second], ["completed"])
 
     def test_project_name_is_redacted_before_storage_and_delivery(self):
@@ -68,6 +76,9 @@ class NotificationStoreTests(unittest.TestCase):
         jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.fakeSignatureValue"
         event = HookEvent("secret", "turn", f"/work/incident{jwt}\n", prompt="work")
         self.store.record_start(event, now=10)
+        self.store.record_thread_metadata(
+            "secret", parent_thread_id=None, source_kind="appServer", now=15
+        )
         self.store.finalize_pending(now=15)
         with self.store.managed_connection() as connection:
             turn = connection.execute("SELECT cwd, project FROM turns").fetchone()
@@ -104,6 +115,9 @@ class NotificationStoreTests(unittest.TestCase):
             thread.start()
         for thread in threads:
             thread.join(timeout=5)
+        self.store.record_thread_metadata(
+            "session-1", parent_thread_id=None, source_kind="appServer", now=15
+        )
         self.store.finalize_pending(now=15)
         with self.store.managed_connection() as connection:
             counts = (
@@ -120,6 +134,12 @@ class NotificationStoreTests(unittest.TestCase):
             HookEvent("a:b", "c", "", prompt="two"),
         ):
             self.store.record_start(event, now=10)
+            self.store.record_thread_metadata(
+                event.session_id,
+                parent_thread_id=None,
+                source_kind="appServer",
+                now=15,
+            )
         self.store.finalize_pending(now=15)
         with self.store.managed_connection() as connection:
             keys = [row[0] for row in connection.execute("SELECT event_key FROM outbox")]
@@ -129,12 +149,13 @@ class NotificationStoreTests(unittest.TestCase):
         self.store.set_enabled(True, now=1)
         self._start()
         self.store.set_enabled(False, now=106)
-        self.assertTrue(
+        self.assertFalse(
             self.store.record_completion(
                 HookEvent("session-1", "turn-1", "", last_assistant_message="done"),
                 now=110,
             )
         )
+        self._finish_aggregation(now=115)
         self.store.record_start(HookEvent("session-1", "turn-2", "", prompt="new"), now=111)
         self.store.finalize_pending(now=116)
         with self.store.managed_connection() as connection:
@@ -150,19 +171,17 @@ class NotificationStoreTests(unittest.TestCase):
         with self.store.managed_connection() as connection:
             self.assertEqual(connection.execute("SELECT status FROM outbox").fetchone()[0], "suppressed")
 
-    def test_enabling_mid_turn_queues_standalone_completion(self):
+    def test_enabling_mid_turn_does_not_notify_unverified_completion(self):
         self._start()
         self.store.set_enabled(True, now=106)
-        self.assertTrue(
+        self.assertFalse(
             self.store.record_completion(
                 HookEvent("session-1", "turn-1", "", last_assistant_message="done"),
                 now=110,
             )
         )
         with self.store.managed_connection() as connection:
-            row = connection.execute("SELECT event_type, payload_json FROM outbox").fetchone()
-        self.assertEqual(row["event_type"], "completed")
-        self.assertTrue(json.loads(row["payload_json"])["incomplete_lifecycle"])
+            self.assertIsNone(connection.execute("SELECT * FROM outbox").fetchone())
 
     def test_status_excludes_abandoned_turn_after_retention(self):
         self.store.set_enabled(True, now=1)
@@ -172,6 +191,29 @@ class NotificationStoreTests(unittest.TestCase):
             self.store.status_snapshot(now=100 + OUTBOX_RETENTION_SECONDS)["active_turns"],
             0,
         )
+
+    def test_status_counts_turn_only_conflicts_without_double_counting_relations(self):
+        self.store.record_start(
+            HookEvent("shared-agent", "turn-1", "", prompt="shared"), now=10
+        )
+        self.store.record_start(
+            HookEvent("turn-only", "turn-2", "", prompt="turn only"), now=11
+        )
+        with self.store.managed_connection() as connection:
+            connection.execute(
+                """INSERT INTO subagents(
+                       agent_id, agent_type, parent_session_id, parent_turn_id,
+                       started_at, state, relation_state
+                   ) VALUES('shared-agent', 'worker', 'parent', 'child-turn',
+                            9, 'conflict', 'CONFLICT')"""
+            )
+            connection.execute(
+                """UPDATE turns
+                   SET classification='CONFLICT', relation_state='CONFLICT'
+                   WHERE session_id IN ('shared-agent', 'turn-only')"""
+            )
+
+        self.assertEqual(self.store.status_snapshot()["conflict_relations"], 2)
 
     def test_claim_lease_recovers_after_worker_crash(self):
         self.store.set_enabled(True, now=1)

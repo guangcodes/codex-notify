@@ -4,6 +4,7 @@ import threading
 import unittest
 from pathlib import Path
 
+from codex_notify.app_server_metadata import ThreadMetadata
 from codex_notify.db import HookEvent, NotificationStore
 from codex_notify.feishu import DeliveryError
 from codex_notify.paths import AppPaths
@@ -54,7 +55,7 @@ class WorkerTests(unittest.TestCase):
         self.assertIn("测试成功", client.messages[0])
         self.assertIn("事件：", client.messages[0])
 
-    def test_worker_sends_standalone_completion_when_enabled_mid_turn(self):
+    def test_worker_keeps_unverified_completion_silent_when_enabled_mid_turn(self):
         event = HookEvent(
             session_id="session-1",
             turn_id="turn-1",
@@ -72,18 +73,197 @@ class WorkerTests(unittest.TestCase):
         self.assertFalse(self.store.record_completion(completion, now=120))
         client = _Client()
 
-        self.assertEqual(run_once(self.store, client_factory=lambda: client, now=120), 1)
+        self.assertEqual(
+            run_once(
+                self.store,
+                client_factory=lambda: client,
+                metadata_reader=lambda _paths, _ids, _turn_ids: {},
+                now=120,
+            ),
+            0,
+        )
 
-        self.assertEqual(len(client.messages), 1)
-        self.assertIn("Codex Turn 结束", client.messages[0])
-        self.assertIn("未观测到对应启动事件", client.messages[0])
+        self.assertEqual(client.messages, [])
         with self.store.managed_connection() as connection:
             rows = connection.execute(
                 "SELECT event_type, status FROM outbox ORDER BY id"
             ).fetchall()
+        self.assertEqual(rows, [])
+
+    def test_worker_uses_metadata_to_send_root_pair_with_aggregation_delay(self):
+        self.store.set_enabled(True, now=90)
+        event = HookEvent(
+            "session-1", "turn-1", "/work/example", prompt="Implement"
+        )
+        self.store.record_start(event, now=100)
+        client = _Client()
+        metadata = ThreadMetadata("session-1", None, "appServer", 90)
+
         self.assertEqual(
-            [(row["event_type"], row["status"]) for row in rows],
-            [("completed", "sent")],
+            run_once(
+                self.store,
+                client_factory=lambda: client,
+                metadata_reader=lambda _paths, _ids, _turn_ids: {
+                    "session-1": metadata
+                },
+                now=105,
+            ),
+            1,
+        )
+        self.store.record_completion(
+            HookEvent(
+                "session-1",
+                "turn-1",
+                "/work/example",
+                last_assistant_message="Done",
+            ),
+            now=106,
+        )
+        self.assertEqual(
+            run_once(self.store, client_factory=lambda: client, now=110), 0
+        )
+        self.assertEqual(
+            run_once(self.store, client_factory=lambda: client, now=111), 1
+        )
+        self.assertEqual(len(client.messages), 2)
+        self.assertIn("Codex Turn 开始", client.messages[0])
+        self.assertIn("Codex Turn 结束", client.messages[1])
+
+    def test_metadata_reader_exception_does_not_escape_worker(self):
+        self.store.set_enabled(True, now=90)
+        self.store.record_start(
+            HookEvent("session-1", "turn-1", "/work/example", prompt="work"),
+            now=100,
+        )
+
+        def fail(_paths, _ids, _turn_ids):
+            raise RuntimeError("protocol drift")
+
+        self.assertEqual(run_once(self.store, metadata_reader=fail, now=105), 0)
+        with self.store.managed_connection() as connection:
+            classification = connection.execute(
+                "SELECT classification FROM turns"
+            ).fetchone()[0]
+        self.assertEqual(classification, "UNVERIFIED")
+
+    def test_busy_metadata_probe_keeps_candidate_pending(self):
+        self.store.set_enabled(True, now=90)
+        self.store.record_start(
+            HookEvent("session-1", "turn-1", "/work/example", prompt="work"),
+            now=100,
+        )
+
+        self.assertEqual(
+            run_once(
+                self.store,
+                metadata_reader=lambda _paths, _ids, _turn_ids: None,
+                now=105,
+            ),
+            0,
+        )
+
+        with self.store.managed_connection() as connection:
+            classification = connection.execute(
+                "SELECT classification FROM turns"
+            ).fetchone()[0]
+        self.assertEqual(classification, "PENDING_ROOT_CANDIDATE")
+
+    def test_worker_defers_metadata_candidates_beyond_single_probe(self):
+        self.store.set_enabled(True, now=90)
+        self.store.record_start(
+            HookEvent("session-1", "turn-1", "/work/example", prompt="one"),
+            now=100,
+        )
+        self.store.record_start(
+            HookEvent("session-2", "turn-2", "/work/example", prompt="two"),
+            now=100.1,
+        )
+        batches = []
+
+        def metadata(_paths, session_ids, turn_ids):
+            batches.append(session_ids)
+            self.assertEqual(
+                turn_ids,
+                {
+                    session_id: f"turn-{session_id.rsplit('-', 1)[1]}"
+                    for session_id in session_ids
+                },
+            )
+            return {
+                session_id: ThreadMetadata(session_id, None, "appServer", 90)
+                for session_id in session_ids
+            }
+
+        client = _Client()
+        self.assertEqual(
+            run_once(
+                self.store,
+                client_factory=lambda: client,
+                metadata_reader=metadata,
+                now=105.1,
+            ),
+            1,
+        )
+        with self.store.managed_connection() as connection:
+            deferred = connection.execute(
+                "SELECT classification FROM turns WHERE session_id='session-2'"
+            ).fetchone()[0]
+        self.assertEqual(batches, [["session-1"]])
+        self.assertEqual(deferred, "PENDING_ROOT_CANDIDATE")
+
+        self.assertEqual(
+            run_once(
+                self.store,
+                client_factory=lambda: client,
+                metadata_reader=metadata,
+                now=106,
+            ),
+            1,
+        )
+        self.assertEqual(batches, [["session-1"], ["session-2"]])
+
+    def test_worker_finalizes_only_the_exact_probed_turn_in_a_session(self):
+        self.store.set_enabled(True, now=90)
+        self.store.record_start(
+            HookEvent("session", "turn-1", "/work/example", prompt="one"),
+            now=100,
+        )
+        self.store.record_completion(
+            HookEvent(
+                "session",
+                "turn-1",
+                "/work/example",
+                last_assistant_message="done",
+            ),
+            now=100.05,
+        )
+        self.store.record_start(
+            HookEvent("session", "turn-2", "/work/example", prompt="two"),
+            now=100.1,
+        )
+        metadata = ThreadMetadata("thread", None, "appServer", 90)
+
+        self.assertEqual(
+            run_once(
+                self.store,
+                client_factory=lambda: _Client(),
+                metadata_reader=lambda _paths, session_ids, turn_ids: {
+                    "session": metadata
+                },
+                now=105.1,
+            ),
+            1,
+        )
+        with self.store.managed_connection() as connection:
+            rows = connection.execute(
+                "SELECT turn_id, classification FROM turns ORDER BY started_at"
+            ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [
+                ("turn-1", "NOTIFIABLE_ROOT"),
+                ("turn-2", "PENDING_ROOT_CANDIDATE"),
+            ],
         )
 
     def test_worker_can_target_new_test_without_draining_old_batch(self):
@@ -104,6 +284,30 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(self.store.event_status(target), "sent")
         self.assertTrue(all(self.store.event_status(key) == "pending" for key in old_keys))
         self.assertEqual(len(client.messages), 1)
+
+    def test_targeted_test_send_does_not_finalize_real_turns(self):
+        self.store.set_enabled(True, now=90)
+        self.store.record_start(
+            HookEvent("session-1", "turn-1", "/work/example", prompt="work"),
+            now=100,
+        )
+        target = self.store.enqueue_test(now=104)
+
+        self.assertEqual(
+            run_once(
+                self.store,
+                client_factory=lambda: _Client(),
+                now=105,
+                event_key=target,
+            ),
+            1,
+        )
+
+        with self.store.managed_connection() as connection:
+            classification = connection.execute(
+                "SELECT classification FROM turns WHERE session_id='session-1'"
+            ).fetchone()[0]
+        self.assertEqual(classification, "PENDING_ROOT_CANDIDATE")
 
     def test_retries_network_failure(self):
         key = self.store.enqueue_test(now=100)

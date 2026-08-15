@@ -1,8 +1,7 @@
 """Independent Turn classification states.
 
-Prompt text is deliberately not a classification input.  Public Codex events do
-not currently bridge a subagent ``agent_id`` to a child Turn identity, so
-``CONFIRMED_CHILD`` is reserved for future direct structured evidence.
+Prompt text is deliberately not a classification input. A child is confirmed
+only from a unique active parent Turn plus exact Hook agent and Turn identity.
 """
 
 from __future__ import annotations
