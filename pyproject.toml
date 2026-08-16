@@ -25,6 +25,10 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/guangcodes/codex-notify"
+Documentation = "https://github.com/guangcodes/codex-notify#readme"
+Changelog = "https://github.com/guangcodes/codex-notify/blob/main/CHANGELOG.md"
+Releases = "https://github.com/guangcodes/codex-notify/releases"
+Security = "https://github.com/guangcodes/codex-notify/security/policy"
 Repository = "https://github.com/guangcodes/codex-notify"
 Issues = "https://github.com/guangcodes/codex-notify/issues"
 

@@ -4,9 +4,14 @@
 
 发布版本：`codex-notify==0.1.0`
 发布源码提交：`e885849561c8f6eb3364d00188a891d12c2ebbe4`
+验收自动化与本文提交：`8a56ed436c66025dbf0a30b2b3cb5983d6d48b5f`
 
 本文记录首个公开版本的实际证据边界。真实 Mac、自动测试和线上发布产物分别记录，
 任何一类通过都不替代另一类。
+
+> 本文是 `v0.1.0` 的历史快照，不描述后续版本的当前行为。当前安装、Turn 分类和隐私边界
+> 以 [README](../README.md) 为准；版本变化见[更新日志](../CHANGELOG.md)和
+> [GitHub Releases](https://github.com/guangcodes/codex-notify/releases)。
 
 ## 发布产物
 
@@ -17,9 +22,10 @@
 | `codex_notify-0.1.0-py3-none-any.whl` | `df7f0bc82a09969ac8d2a58daff7bc05e22448df8dc7d14e8e3e2de517f12035` | 一致 |
 | `codex_notify-0.1.0.tar.gz` | `bdc040cd94b07cc0f73efa09e14893fbf17d9202cea93cddf0b918b5adab427e` | 一致 |
 
-后续发布工作流会在 Trusted Publisher 上传完成后自动执行同一检查；也可以手动运行
-`Release integrity` workflow 复核任意 tag。仓库本地 `dist/` 可能来自另一次构建，
-不能仅凭文件名视为已发布资产。
+验收提交 `8a56ed4` 新增的发布工作流会在 Trusted Publisher 上传完成后执行同一检查，
+并提供手动 `Release integrity` workflow 复核 tag。这里记录的是该验收提交当时的自动化，
+不保证后续版本仍使用相同工作流。仓库本地 `dist/` 可能来自另一次构建，不能仅凭文件名
+视为已发布资产。
 
 ## 真实 Mac 集成
 
@@ -35,7 +41,7 @@
 - `io.github.guangcodes.codex-notify` LaunchAgent 已加载，旧 label 未残留。
 
 此前在同一最终 runtime 源码上已观察到真实用户 Turn 的启动/完成飞书消息，以及真实 child
-Turn 事件。公开事件无法稳定证明 child Turn 与父 Turn 的关联时，当前策略按设计失败开放，
+Turn 事件。公开事件无法稳定证明 child Turn 与父 Turn 的关联时，`v0.1.0` 策略按设计失败开放，
 允许其作为独立完成通知；这不是“已完全消除内部 Turn 误报”的证明。
 
 最终 PyPI wheel 又在全新虚拟环境完成了 CLI 与安装器 smoke。发布前最后一次目标 Mac 集成
@@ -45,8 +51,8 @@ Turn 事件。公开事件无法稳定证明 child Turn 与父 Turn 的关联时
 
 ## 自动验收
 
-CI 对 macOS 和 Python 3.11、3.12、3.13 执行完整单元测试、`ResourceWarning`、
-`compileall` 与敏感信息扫描。打包任务还执行：
+验收提交 `8a56ed4` 的 CI 对 macOS 和 Python 3.11、3.12、3.13 执行完整单元测试、
+`ResourceWarning`、`compileall` 与敏感信息扫描。该提交的打包任务还执行：
 
 - 解包检查 wheel 与 sdist 的路径白名单、缓存、运行数据、个人绝对路径和私有工具路径。
 - 在两个全新 venv 中分别执行 `pip install <wheel>` 与从全新 clone 执行 `pip install .`。

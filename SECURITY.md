@@ -2,8 +2,11 @@
 
 ## 支持版本
 
-项目只支持最新公开版本，仅适用于 macOS。运行环境需要 Python 3.11 或更高版本，
-并且必须安装已签名、能够通过安装器运行时能力检查的 Codex Computer Use。
+项目只为[最新公开版本](https://github.com/guangcodes/codex-notify/releases/latest)提供安全更新，
+更早版本不受支持。升级 Python 包后必须重新执行 `codex-notify install`。
+
+项目仅支持 macOS。Python、Codex Computer Use 和其他运行要求以
+[README 的依赖与兼容性说明](https://github.com/guangcodes/codex-notify#依赖与兼容性)为准。
 
 ## 报告安全漏洞
 
@@ -11,8 +14,8 @@
 [GitHub 私密漏洞报告功能](https://github.com/guangcodes/codex-notify/security/advisories/new)，
 并提供受影响版本、复现步骤、影响范围，以及可选的缓解建议。
 
-仓库管理员已于 2026-08-13 通过 GitHub API 确认该功能处于启用状态。若上述入口不可用，
-请勿改用公开 Issue 披露漏洞细节；等待仓库管理员恢复私密报告入口。
+仓库当前已启用私密漏洞报告。若上述入口不可用，请勿改用公开 Issue 披露漏洞细节；等待
+仓库管理员恢复私密报告入口。
 
 报告中不得包含真实飞书 Webhook、签名密钥、Keychain 值、Transcript 或 Codex 私有数据。
 如果凭据已经暴露，请先撤销或轮换凭据。
