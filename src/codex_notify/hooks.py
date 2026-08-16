@@ -7,7 +7,13 @@ import hashlib
 import sys
 from typing import Any, TextIO
 
-from .db import HookEvent, NotificationStore, PermissionEvent, SubagentEvent
+from .db import (
+    HookEvent,
+    NotificationStore,
+    PermissionEvent,
+    RequestUserInputEvent,
+    SubagentEvent,
+)
 from .logging_utils import append_error
 
 
@@ -59,6 +65,34 @@ def process_hook(
                 turn_id=str(payload.get("turn_id") or ""),
                 tool_name=str(payload.get("tool_name") or ""),
                 event_fingerprint=fingerprint,
+            )
+        )
+    elif event_name == "PreToolUse":
+        tool_name = payload.get("tool_name")
+        if tool_name != "request_user_input":
+            return
+        tool_use_id = payload.get("tool_use_id")
+        if isinstance(tool_use_id, str) and tool_use_id and "\0" not in tool_use_id:
+            fingerprint_source: object = [
+                payload.get("session_id"),
+                payload.get("turn_id"),
+                tool_name,
+                tool_use_id,
+            ]
+        else:
+            fingerprint_source = payload
+        canonical = json.dumps(
+            fingerprint_source,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        store.record_request_user_input(
+            RequestUserInputEvent(
+                session_id=str(payload.get("session_id") or ""),
+                turn_id=str(payload.get("turn_id") or ""),
+                tool_name=tool_name,
+                signal_fingerprint=hashlib.sha256(canonical).hexdigest(),
             )
         )
     else:

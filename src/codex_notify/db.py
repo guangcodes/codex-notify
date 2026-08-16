@@ -25,6 +25,12 @@ from .constants import (
     TERMINAL_CALIBRATION_SECONDS,
     TERMINAL_SCAN_RETRY_SECONDS,
 )
+from .experimental_status import (
+    EXPERIMENTAL_FEATURES,
+    FEATURE_MCP_AUTH,
+    FEATURE_RATE_LIMITS,
+    ExperimentalSnapshot,
+)
 from .paths import AppPaths
 from .redact import safe_summary
 
@@ -133,10 +139,35 @@ CREATE TABLE IF NOT EXISTS subagents (
 
 CREATE INDEX IF NOT EXISTS idx_subagents_parent
 ON subagents(parent_session_id, parent_turn_id);
+
+CREATE TABLE IF NOT EXISTS experimental_signal_state (
+    feature TEXT NOT NULL,
+    signal_key TEXT NOT NULL,
+    scope TEXT NOT NULL CHECK (scope IN ('global', 'turn')),
+    certainty TEXT NOT NULL DEFAULT 'best_effort',
+    signal_source TEXT NOT NULL,
+    signal_kind TEXT NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    last_state TEXT NOT NULL,
+    observed_at REAL NOT NULL,
+    last_success_at REAL NOT NULL,
+    transition_count INTEGER NOT NULL DEFAULT 0,
+    signal_id TEXT,
+    cooldown_key TEXT,
+    last_notified_cooldown_key TEXT,
+    last_notified_at REAL,
+    PRIMARY KEY (feature, signal_key)
+);
 """
 
 _CWD_SCRUB_SETTING = "raw_cwd_scrubbed_v1"
-_SCHEMA_VERSION = 7
+_SCHEMA_VERSION = 8
+
+_EXPERIMENTAL_EVENT_TYPES = {
+    "request-user-input": "experimental_request_user_input",
+    FEATURE_MCP_AUTH: "experimental_mcp_auth",
+    FEATURE_RATE_LIMITS: "experimental_rate_limit",
+}
 
 
 @dataclass(frozen=True)
@@ -169,6 +200,14 @@ class PermissionEvent:
     tool_name: str
     event_fingerprint: str
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class RequestUserInputEvent:
+    session_id: str
+    turn_id: str
+    tool_name: str
+    signal_fingerprint: str
 
 
 class NotificationStore:
@@ -209,6 +248,17 @@ class NotificationStore:
                         "VALUES('delivery_paused', '0', ?)",
                         (now,),
                     )
+                    for feature in EXPERIMENTAL_FEATURES:
+                        connection.execute(
+                            "INSERT OR IGNORE INTO settings(key, value, updated_at) "
+                            "VALUES(?, '0', ?)",
+                            (f"experimental.{feature}.enabled", now),
+                        )
+                        connection.execute(
+                            "INSERT OR IGNORE INTO settings(key, value, updated_at) "
+                            "VALUES(?, 'unprobed', ?)",
+                            (f"experimental.{feature}.capability", now),
+                        )
                     scrubbed = connection.execute(
                         "SELECT 1 FROM settings WHERE key=?", (_CWD_SCRUB_SETTING,)
                     ).fetchone()
@@ -299,6 +349,29 @@ class NotificationStore:
         for name, declaration in subagent_additions.items():
             if name not in subagent_columns:
                 connection.execute(f"ALTER TABLE subagents ADD COLUMN {name} {declaration}")
+
+        experimental_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(experimental_signal_state)"
+            )
+        }
+        experimental_additions = {
+            "certainty": "TEXT NOT NULL DEFAULT 'best_effort'",
+            "signal_source": "TEXT NOT NULL DEFAULT ''",
+            "signal_kind": "TEXT NOT NULL DEFAULT ''",
+            "display_name": "TEXT NOT NULL DEFAULT ''",
+            "transition_count": "INTEGER NOT NULL DEFAULT 0",
+            "signal_id": "TEXT",
+            "cooldown_key": "TEXT",
+            "last_notified_cooldown_key": "TEXT",
+            "last_notified_at": "REAL",
+        }
+        for name, declaration in experimental_additions.items():
+            if name not in experimental_columns:
+                connection.execute(
+                    f"ALTER TABLE experimental_signal_state ADD COLUMN {name} {declaration}"
+                )
 
         current_version = connection.execute("PRAGMA user_version").fetchone()[0]
         if current_version < 5:
@@ -477,6 +550,13 @@ class NotificationStore:
                    SET status='suppressed', last_error='suppressed by off --now'
                    WHERE status IN ('pending', 'retry')"""
             )
+            connection.execute(
+                """UPDATE experimental_signal_state
+                   SET last_notified_cooldown_key=cooldown_key,
+                       last_notified_at=?
+                   WHERE cooldown_key IS NOT NULL""",
+                (now,),
+            )
 
     def _finish_immediate_off(self) -> None:
         with self.managed_connection() as connection:
@@ -493,11 +573,381 @@ class NotificationStore:
                 self._write_setting(connection, "delivery_paused", "0", now)
             else:
                 connection.execute(
+                    """UPDATE outbox
+                       SET status='suppressed',
+                           last_error='notifications disabled before root confirmation'
+                       WHERE event_type='experimental_request_user_input'
+                         AND status IN ('pending', 'retry', 'sending')
+                         AND EXISTS(
+                             SELECT 1 FROM turns
+                             WHERE turns.session_id=outbox.session_id
+                               AND turns.turn_id=outbox.turn_id
+                               AND turns.classification='PENDING_ROOT_CANDIDATE')"""
+                )
+                connection.execute(
                     """UPDATE turns
                        SET notify_pair=0, pending_completion_enabled=0
                        WHERE classification='PENDING_ROOT_CANDIDATE'
                          AND suppressed=0"""
                 )
+
+    def set_experimental_capability(
+        self, feature: str, available: bool, reason: str, *, now: float | None = None
+    ) -> None:
+        _require_experimental_feature(feature)
+        now = now if now is not None else time.time()
+        with self.delivery_lock():
+            with self.managed_connection() as connection:
+                self._write_setting(
+                    connection,
+                    f"experimental.{feature}.capability",
+                    "available" if available else "unavailable",
+                    now,
+                )
+                self._write_setting(
+                    connection,
+                    f"experimental.{feature}.reason",
+                    safe_summary(reason, 200),
+                    now,
+                )
+                if not available:
+                    self._write_setting(
+                        connection, f"experimental.{feature}.enabled", "0", now
+                    )
+                    self._suppress_experimental_outbox(
+                        connection, feature, "experimental capability unavailable"
+                    )
+
+    def set_experimental_enabled(
+        self, feature: str, enabled: bool, *, now: float | None = None
+    ) -> None:
+        _require_experimental_feature(feature)
+        now = now if now is not None else time.time()
+        with self.delivery_lock():
+            with self.managed_connection() as connection:
+                if enabled:
+                    row = connection.execute(
+                        "SELECT value FROM settings WHERE key=?",
+                        (f"experimental.{feature}.capability",),
+                    ).fetchone()
+                    if row is None or row["value"] != "available":
+                        raise ValueError(f"实验功能 {feature} 当前 unavailable，不能启用")
+                self._write_setting(
+                    connection,
+                    f"experimental.{feature}.enabled",
+                    "1" if enabled else "0",
+                    now,
+                )
+                if not enabled:
+                    self._suppress_experimental_outbox(
+                        connection, feature, "experimental feature disabled"
+                    )
+
+    @staticmethod
+    def _suppress_experimental_outbox(
+        connection: sqlite3.Connection, feature: str, reason: str
+    ) -> None:
+        connection.execute(
+            """UPDATE outbox
+               SET status='suppressed', last_error=?
+               WHERE event_type=? AND status IN ('pending', 'retry', 'sending')""",
+            (reason, _EXPERIMENTAL_EVENT_TYPES[feature]),
+        )
+
+    def is_experimental_enabled(
+        self, feature: str, connection: sqlite3.Connection | None = None
+    ) -> bool:
+        _require_experimental_feature(feature)
+        owned = connection is None
+        connection = connection or self.connect()
+        try:
+            row = connection.execute(
+                "SELECT value FROM settings WHERE key=?",
+                (f"experimental.{feature}.enabled",),
+            ).fetchone()
+            return bool(row and row["value"] == "1")
+        finally:
+            if owned:
+                connection.close()
+
+    def experimental_feature_status(self) -> dict[str, dict[str, str | bool]]:
+        with self.managed_connection() as connection:
+            settings = {
+                row["key"]: row["value"]
+                for row in connection.execute(
+                    "SELECT key, value FROM settings WHERE key LIKE 'experimental.%'"
+                )
+            }
+        return {
+            feature: {
+                "enabled": settings.get(f"experimental.{feature}.enabled") == "1",
+                "capability": settings.get(
+                    f"experimental.{feature}.capability", "unprobed"
+                ),
+                "reason": settings.get(f"experimental.{feature}.reason", "尚未探测"),
+            }
+            for feature in EXPERIMENTAL_FEATURES
+        }
+
+    def experimental_query_features(self, *, now: float | None = None) -> set[str]:
+        now = now if now is not None else time.time()
+        with self.managed_connection() as connection:
+            if not self.is_enabled(connection):
+                return set()
+            next_row = connection.execute(
+                "SELECT value FROM settings WHERE key='experimental.query.next_at'"
+            ).fetchone()
+            try:
+                next_at = float(next_row["value"]) if next_row else 0.0
+            except (TypeError, ValueError):
+                next_at = 0.0
+            if next_at > now:
+                return set()
+            return {
+                feature
+                for feature in (FEATURE_MCP_AUTH, FEATURE_RATE_LIMITS)
+                if self.is_experimental_enabled(feature, connection)
+            }
+
+    def mark_experimental_query_attempt(self, *, now: float | None = None) -> None:
+        now = now if now is not None else time.time()
+        with self.managed_connection() as connection:
+            self._write_setting(connection, "experimental.query.last_attempt_at", str(now), now)
+            self._write_setting(connection, "experimental.query.next_at", str(now + 60), now)
+
+    def record_experimental_snapshot(
+        self, snapshot: ExperimentalSnapshot, *, now: float | None = None
+    ) -> int:
+        now = now if now is not None else time.time()
+        queued = 0
+        with self.managed_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if snapshot.mcp_auth is not None:
+                self._write_setting(
+                    connection, "experimental.mcp-auth.last_success_at", str(now), now
+                )
+                observed_mcp_keys = {
+                    observation.signal_key for observation in snapshot.mcp_auth
+                }
+                for observation in snapshot.mcp_auth:
+                    row = connection.execute(
+                        "SELECT * FROM experimental_signal_state WHERE feature=? AND signal_key=?",
+                        (FEATURE_MCP_AUTH, observation.signal_key),
+                    ).fetchone()
+                    previous_state = row["last_state"] if row is not None else None
+                    transition_count = int(row["transition_count"]) if row is not None else 0
+                    if previous_state != observation.auth_status:
+                        transition_count += 1
+                    last_notified = (
+                        row["last_notified_cooldown_key"] if row is not None else None
+                    )
+                    indeterminate_states = {"notLoggedIn", "unknown", "unsupported"}
+                    preserves_active_episode = (
+                        observation.auth_status in indeterminate_states
+                        and previous_state in indeterminate_states
+                        and last_notified is not None
+                    )
+                    cooldown_key = (
+                        last_notified
+                        if preserves_active_episode
+                        else f"notLoggedIn:{transition_count}"
+                    )
+                    if observation.auth_status in {"bearerToken", "oAuth"}:
+                        last_notified = None
+                    signal_id = hashlib.sha256(
+                        f"{observation.signal_key}:{transition_count}".encode("utf-8")
+                    ).hexdigest()[:16]
+                    connection.execute(
+                        """INSERT INTO experimental_signal_state(
+                               feature, signal_key, scope, certainty, signal_source,
+                               signal_kind, display_name, last_state,
+                               observed_at, last_success_at, transition_count, signal_id,
+                               cooldown_key, last_notified_cooldown_key, last_notified_at
+                           ) VALUES(?, ?, 'global', 'best_effort', 'app_server_status',
+                                    'mcp_auth_not_logged_in', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(feature, signal_key) DO UPDATE SET
+                               certainty=excluded.certainty,
+                               signal_source=excluded.signal_source,
+                               signal_kind=excluded.signal_kind,
+                               display_name=excluded.display_name,
+                               last_state=excluded.last_state,
+                               observed_at=excluded.observed_at,
+                               last_success_at=excluded.last_success_at,
+                               transition_count=excluded.transition_count,
+                               signal_id=excluded.signal_id,
+                               cooldown_key=excluded.cooldown_key,
+                               last_notified_cooldown_key=excluded.last_notified_cooldown_key,
+                               last_notified_at=excluded.last_notified_at""",
+                        (
+                            FEATURE_MCP_AUTH,
+                            observation.signal_key,
+                            observation.display_name,
+                            observation.auth_status,
+                            now,
+                            now,
+                            transition_count,
+                            signal_id,
+                            cooldown_key,
+                            last_notified,
+                            row["last_notified_at"] if row is not None else None,
+                        ),
+                    )
+                    if (
+                        observation.auth_status == "notLoggedIn"
+                        and last_notified != cooldown_key
+                        and self.is_enabled(connection)
+                        and self.is_experimental_enabled(FEATURE_MCP_AUTH, connection)
+                    ):
+                        event_key = _event_key(
+                            "global", observation.signal_key, f"mcp-auth:{cooldown_key}"
+                        )
+                        cursor = self._insert_outbox(
+                            connection,
+                            event_key=event_key,
+                            event_type="experimental_mcp_auth",
+                            session_id=None,
+                            turn_id=None,
+                            payload=_experimental_payload(
+                                event_key,
+                                now,
+                                "app_server_status",
+                                "mcp_auth_not_logged_in",
+                                signal_id,
+                                display_name=observation.display_name,
+                            ),
+                            due_at=now,
+                            now=now,
+                        )
+                        if cursor.rowcount == 1:
+                            queued += 1
+                            connection.execute(
+                                """UPDATE experimental_signal_state
+                                   SET last_notified_cooldown_key=?, last_notified_at=?
+                                   WHERE feature=? AND signal_key=?""",
+                                (
+                                    cooldown_key,
+                                    now,
+                                    FEATURE_MCP_AUTH,
+                                    observation.signal_key,
+                                ),
+                            )
+                missing_filter = ""
+                missing_parameters: list[Any] = [now, now, FEATURE_MCP_AUTH]
+                if observed_mcp_keys:
+                    placeholders = ",".join("?" for _key in observed_mcp_keys)
+                    missing_filter = f" AND signal_key NOT IN ({placeholders})"
+                    missing_parameters.extend(sorted(observed_mcp_keys))
+                connection.execute(
+                    f"""UPDATE experimental_signal_state
+                        SET last_state='absent',
+                            observed_at=?,
+                            last_success_at=?,
+                            transition_count=transition_count+1,
+                            signal_id=NULL,
+                            cooldown_key=NULL,
+                            last_notified_cooldown_key=NULL
+                        WHERE feature=? AND last_state!='absent'
+                        {missing_filter}""",
+                    missing_parameters,
+                )
+            if snapshot.rate_limits is not None:
+                self._write_setting(
+                    connection, "experimental.rate-limits.last_success_at", str(now), now
+                )
+                for observation in snapshot.rate_limits:
+                    row = connection.execute(
+                        "SELECT * FROM experimental_signal_state WHERE feature=? AND signal_key=?",
+                        (FEATURE_RATE_LIMITS, observation.signal_key),
+                    ).fetchone()
+                    state = observation.reached_type or "normal"
+                    transition_count = int(row["transition_count"]) if row is not None else 0
+                    if row is None or row["last_state"] != state:
+                        transition_count += 1
+                    last_notified = (
+                        row["last_notified_cooldown_key"] if row is not None else None
+                    )
+                    signal_id = observation.cooldown_key[:16]
+                    connection.execute(
+                        """INSERT INTO experimental_signal_state(
+                               feature, signal_key, scope, certainty, signal_source,
+                               signal_kind, last_state, observed_at,
+                               last_success_at, transition_count, signal_id, cooldown_key,
+                               last_notified_cooldown_key, last_notified_at
+                           ) VALUES(?, ?, 'global', 'best_effort', 'app_server_status',
+                                    'account_rate_limit_reached', ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(feature, signal_key) DO UPDATE SET
+                               certainty=excluded.certainty,
+                               signal_source=excluded.signal_source,
+                               signal_kind=excluded.signal_kind,
+                               last_state=excluded.last_state,
+                               observed_at=excluded.observed_at,
+                               last_success_at=excluded.last_success_at,
+                               transition_count=excluded.transition_count,
+                               signal_id=excluded.signal_id,
+                               cooldown_key=excluded.cooldown_key,
+                               last_notified_cooldown_key=excluded.last_notified_cooldown_key,
+                               last_notified_at=excluded.last_notified_at""",
+                        (
+                            FEATURE_RATE_LIMITS,
+                            observation.signal_key,
+                            state,
+                            now,
+                            now,
+                            transition_count,
+                            signal_id,
+                            observation.cooldown_key,
+                            last_notified,
+                            row["last_notified_at"] if row is not None else None,
+                        ),
+                    )
+                    if (
+                        observation.reached_type is not None
+                        and last_notified != observation.cooldown_key
+                        and self.is_enabled(connection)
+                        and self.is_experimental_enabled(FEATURE_RATE_LIMITS, connection)
+                    ):
+                        event_key = _event_key(
+                            "global",
+                            observation.signal_key,
+                            f"rate-limit:{observation.cooldown_key}",
+                        )
+                        cursor = self._insert_outbox(
+                            connection,
+                            event_key=event_key,
+                            event_type="experimental_rate_limit",
+                            session_id=None,
+                            turn_id=None,
+                            payload=_experimental_payload(
+                                event_key,
+                                now,
+                                "app_server_status",
+                                "account_rate_limit_reached",
+                                signal_id,
+                            ),
+                            due_at=now,
+                            now=now,
+                        )
+                        if cursor.rowcount == 1:
+                            queued += 1
+                            connection.execute(
+                                """UPDATE experimental_signal_state
+                                   SET last_notified_cooldown_key=?, last_notified_at=?
+                                   WHERE feature=? AND signal_key=?""",
+                                (
+                                    observation.cooldown_key,
+                                    now,
+                                    FEATURE_RATE_LIMITS,
+                                    observation.signal_key,
+                                ),
+                            )
+            if snapshot.mcp_auth is not None or snapshot.rate_limits is not None:
+                self._write_setting(
+                    connection, "experimental.query.last_success_at", str(now), now
+                )
+                self._write_setting(
+                    connection, "experimental.query.next_at", str(now + 300), now
+                )
+        return queued
 
     @staticmethod
     def _write_setting(
@@ -849,6 +1299,107 @@ class NotificationStore:
             )
             return cursor.rowcount == 1
 
+    def record_request_user_input(
+        self, event: RequestUserInputEvent, *, now: float | None = None
+    ) -> bool:
+        if (
+            event.tool_name != "request_user_input"
+            or not _valid_event_identity(
+                HookEvent(event.session_id, event.turn_id, "")
+            )
+            or not _valid_fingerprint(event.signal_fingerprint)
+        ):
+            return False
+        now = now if now is not None else time.time()
+        with self.managed_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if (
+                not self.is_enabled(connection)
+                or not self.is_experimental_enabled(
+                    "request-user-input", connection
+                )
+            ):
+                return False
+            source = connection.execute(
+                "SELECT * FROM turns WHERE session_id=? AND turn_id=?",
+                (event.session_id, event.turn_id),
+            ).fetchone()
+            if (
+                source is None
+                or source["lifecycle"] != "RUNNING"
+                or source["terminal_status"] is not None
+            ):
+                return False
+            is_child = source["classification"] == "CONFIRMED_CHILD"
+            root = source
+            if is_child:
+                if (
+                    source["relation_state"] != "CONFIRMED"
+                    or not source["parent_session_id"]
+                    or not source["parent_turn_id"]
+                ):
+                    return False
+                root = connection.execute(
+                    """SELECT * FROM turns
+                       WHERE session_id=? AND turn_id=?
+                         AND classification='NOTIFIABLE_ROOT'""",
+                    (source["parent_session_id"], source["parent_turn_id"]),
+                ).fetchone()
+                if root is None:
+                    return False
+            elif source["classification"] not in {
+                "PENDING_ROOT_CANDIDATE",
+                "NOTIFIABLE_ROOT",
+            }:
+                return False
+            if (
+                root["lifecycle"] != "RUNNING"
+                or root["terminal_status"] is not None
+                or not root["notify_pair"]
+                or root["suppressed"]
+            ):
+                return False
+            start = self._start_outbox_row(connection, root)
+            pending_root = root["classification"] == "PENDING_ROOT_CANDIDATE"
+            if (start is None and not pending_root) or (
+                start is not None and start["status"] == "suppressed"
+            ):
+                return False
+            event_key = _event_key(
+                root["session_id"],
+                root["turn_id"],
+                f"request-user-input:{event.signal_fingerprint}",
+            )
+            cursor = self._insert_outbox(
+                connection,
+                event_key=event_key,
+                event_type="experimental_request_user_input",
+                session_id=root["session_id"],
+                turn_id=root["turn_id"],
+                payload={
+                    **_experimental_payload(
+                        event_key,
+                        now,
+                        "hook",
+                        "request_user_input",
+                        event.signal_fingerprint[:16],
+                    ),
+                    "project": root["project"],
+                    "turn_id": root["turn_id"],
+                    "child_signal": is_child,
+                },
+                due_at=(
+                    max(now, float(root["decision_due_at"]))
+                    if pending_root and root["decision_due_at"] is not None
+                    else now
+                ),
+                now=now,
+                depends_on_event_key=_event_key(
+                    root["session_id"], root["turn_id"], "started"
+                ),
+            )
+            return cursor.rowcount == 1
+
     def finalize_pending(
         self,
         *,
@@ -904,7 +1455,9 @@ class NotificationStore:
                            SET status='suppressed',
                                last_error='root identity was not confirmed'
                            WHERE session_id=? AND turn_id=?
-                             AND event_type='permission'
+                             AND event_type IN (
+                                 'permission', 'experimental_request_user_input'
+                             )
                              AND status IN ('pending', 'retry')""",
                         (turn["session_id"], turn["turn_id"]),
                     )
@@ -1622,7 +2175,9 @@ class NotificationStore:
                    WHERE status IN ('pending', 'retry') AND next_attempt_at<=?
                      {dependent_filter}
                      AND (
-                         event_type<>'permission'
+                         event_type NOT IN (
+                             'permission', 'experimental_request_user_input'
+                         )
                          OR EXISTS(
                              SELECT 1 FROM turns
                              WHERE turns.session_id=outbox.session_id
@@ -1859,6 +2414,14 @@ class NotificationStore:
                 """SELECT COUNT(*) AS count FROM outbox
                    WHERE event_type='permission' AND status='sent'"""
             ).fetchone()["count"]
+            best_effort_total = connection.execute(
+                """SELECT COUNT(*) AS count FROM outbox
+                   WHERE event_type LIKE 'experimental_%'"""
+            ).fetchone()["count"]
+            best_effort_sent = connection.execute(
+                """SELECT COUNT(*) AS count FROM outbox
+                   WHERE event_type LIKE 'experimental_%' AND status='sent'"""
+            ).fetchone()["count"]
             return {
                 "enabled": enabled,
                 "active_turns": active,
@@ -1874,6 +2437,16 @@ class NotificationStore:
                 "interrupted_turns": terminal_counts.get("interrupted", 0),
                 "permission_total": permission_total,
                 "permission_sent": permission_sent,
+                "confirmed_total": connection.execute(
+                    """SELECT COUNT(*) AS count FROM outbox
+                       WHERE event_type IN ('started', 'completed', 'permission')"""
+                ).fetchone()["count"],
+                "best_effort_total": best_effort_total,
+                "best_effort_sent": best_effort_sent,
+                "experimental_features": self.experimental_feature_status(),
+                "last_experimental_query_at": settings.get(
+                    "experimental.query.last_success_at"
+                ),
                 "last_terminal_query_ok": settings.get("last_terminal_query_ok"),
                 "last_terminal_query_at": settings.get("last_terminal_query_at"),
                 "dead": counts.get("dead", 0),
@@ -1911,10 +2484,42 @@ def _valid_permission_event(event: PermissionEvent) -> bool:
     return (
         _valid_identifier(event.session_id)
         and _valid_identifier(event.turn_id)
-        and isinstance(event.event_fingerprint, str)
-        and len(event.event_fingerprint) == 64
-        and all(character in "0123456789abcdef" for character in event.event_fingerprint)
+        and _valid_fingerprint(event.event_fingerprint)
     )
+
+
+def _valid_fingerprint(value: str) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _require_experimental_feature(feature: str) -> None:
+    if feature not in EXPERIMENTAL_FEATURES:
+        raise ValueError(f"未知实验功能：{feature}")
+
+
+def _experimental_payload(
+    event_key: str,
+    observed_at: float,
+    signal_source: str,
+    signal_kind: str,
+    signal_id: str,
+    *,
+    display_name: str = "",
+) -> dict[str, Any]:
+    return {
+        "certainty": "best_effort",
+        "signal_source": signal_source,
+        "signal_kind": signal_kind,
+        "observed_at": observed_at,
+        "occurred_at": observed_at,
+        "signal_id": signal_id,
+        "event_id": _delivery_id(event_key),
+        "display_name": safe_summary(display_name, 80),
+    }
 
 
 def _permission_operation(tool_name: str) -> str:

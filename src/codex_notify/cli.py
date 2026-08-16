@@ -19,8 +19,18 @@ from pathlib import Path
 from . import __version__
 from .app_server_metadata import find_bundled_codex
 from .computer_use import inspect_computer_use
-from .constants import HOOK_STATUS_PERMISSION, HOOK_STATUS_START
+from .constants import (
+    HOOK_STATUS_PERMISSION,
+    HOOK_STATUS_REQUEST_USER_INPUT,
+    HOOK_STATUS_START,
+)
 from .db import NotificationStore
+from .experimental_status import (
+    EXPERIMENTAL_FEATURES,
+    ExperimentalCapability,
+    probe_experimental_capabilities,
+    read_experimental_capabilities,
+)
 from .feishu import validate_webhook_url
 from .hooks import hook_main
 from .installer import (
@@ -62,6 +72,14 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("test", help="立即发送一条飞书测试通知")
     commands.add_parser("configure", help="安全地将飞书凭据写入 macOS Keychain")
     commands.add_parser("doctor", help="检查凭据、Hook 和后台服务配置")
+    experimental = commands.add_parser("experimental", help="管理尽力通知实验功能")
+    experimental_commands = experimental.add_subparsers(
+        dest="experimental_command", required=True
+    )
+    experimental_commands.add_parser("status", help="显示实验功能状态")
+    for action in ("enable", "disable"):
+        command = experimental_commands.add_parser(action)
+        command.add_argument("feature", choices=EXPERIMENTAL_FEATURES)
     worker = commands.add_parser("worker", help=argparse.SUPPRESS)
     worker.add_argument("--once", action="store_true")
     hook = commands.add_parser("hook", help=argparse.SUPPRESS)
@@ -111,63 +129,86 @@ def _installed_runtime_version(package_dir: Path) -> str | None:
     return None
 
 
-def _app_server_terminal_capability(binary: Path | None) -> bool:
-    if binary is None:
-        return False
+def _generate_app_server_schema(binary: Path, output_directory: Path) -> bool:
     try:
-        with tempfile.TemporaryDirectory(prefix="codex-notify-schema-") as directory:
-            result = subprocess.run(
-                [
-                    str(binary),
-                    "app-server",
-                    "generate-json-schema",
-                    "--experimental",
-                    "--out",
-                    directory,
-                ],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-            )
-            if result.returncode != 0:
-                return False
-            root = Path(directory) / "v2"
-            params = json.loads(
-                (root / "ThreadTurnsListParams.json").read_text(encoding="utf-8")
-            )
-            response = json.loads(
-                (root / "ThreadTurnsListResponse.json").read_text(encoding="utf-8")
-            )
-            item_views = params["definitions"]["TurnItemsView"]["oneOf"]
-            statuses = response["definitions"]["TurnStatus"]["enum"]
-            turn = response["definitions"]["Turn"]
-            if (
-                not isinstance(item_views, list)
-                or not all(isinstance(item, dict) for item in item_views)
-                or not isinstance(statuses, list)
-                or not all(isinstance(status, str) for status in statuses)
-                or not isinstance(turn, dict)
-                or not isinstance(turn.get("properties"), dict)
-            ):
-                return False
-            return (
-                any(item.get("enum") == ["notLoaded"] for item in item_views)
-                and set(statuses)
-                == {"completed", "failed", "interrupted", "inProgress"}
-                and {"id", "status", "items", "itemsView"}.issubset(
-                    turn["properties"]
-                )
-            )
+        result = subprocess.run(
+            [
+                str(binary),
+                "app-server",
+                "generate-json-schema",
+                "--experimental",
+                "--out",
+                str(output_directory),
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _app_server_terminal_capability_from_schema(output_directory: Path) -> bool:
+    try:
+        root = output_directory / "v2"
+        params = json.loads(
+            (root / "ThreadTurnsListParams.json").read_text(encoding="utf-8")
+        )
+        response = json.loads(
+            (root / "ThreadTurnsListResponse.json").read_text(encoding="utf-8")
+        )
+        item_views = params["definitions"]["TurnItemsView"]["oneOf"]
+        statuses = response["definitions"]["TurnStatus"]["enum"]
+        turn = response["definitions"]["Turn"]
+        if (
+            not isinstance(item_views, list)
+            or not all(isinstance(item, dict) for item in item_views)
+            or not isinstance(statuses, list)
+            or not all(isinstance(status, str) for status in statuses)
+            or not isinstance(turn, dict)
+            or not isinstance(turn.get("properties"), dict)
+        ):
+            return False
+        return (
+            any(item.get("enum") == ["notLoaded"] for item in item_views)
+            and set(statuses) == {"completed", "failed", "interrupted", "inProgress"}
+            and {"id", "status", "items", "itemsView"}.issubset(turn["properties"])
+        )
     except (
         OSError,
-        subprocess.SubprocessError,
         json.JSONDecodeError,
         KeyError,
         TypeError,
         UnicodeError,
     ):
         return False
+
+
+def _app_server_terminal_capability(binary: Path | None) -> bool:
+    if binary is None:
+        return False
+    with tempfile.TemporaryDirectory(prefix="codex-notify-schema-") as directory:
+        output_directory = Path(directory)
+        return _generate_app_server_schema(
+            binary, output_directory
+        ) and _app_server_terminal_capability_from_schema(output_directory)
+
+
+def _app_server_capabilities(
+    binary: Path | None,
+) -> tuple[bool, dict[str, ExperimentalCapability]]:
+    if binary is None:
+        return False, probe_experimental_capabilities(None)
+    with tempfile.TemporaryDirectory(prefix="codex-notify-schema-") as directory:
+        output_directory = Path(directory)
+        generated = _generate_app_server_schema(binary, output_directory)
+        experimental = read_experimental_capabilities(output_directory)
+        return (
+            generated and _app_server_terminal_capability_from_schema(output_directory),
+            experimental,
+        )
 
 
 def _status(store: NotificationStore) -> None:
@@ -189,6 +230,23 @@ def _status(store: NotificationStore) -> None:
         "审批通知："
         f"总计={snapshot.get('permission_total', 0)}，"
         f"已发送={snapshot.get('permission_sent', 0)}"
+    )
+    print(
+        "通知可信度统计："
+        f"confirmed={snapshot.get('confirmed_total', 0)}，"
+        f"best_effort={snapshot.get('best_effort_total', 0)}，"
+        f"best_effort已发送={snapshot.get('best_effort_sent', 0)}"
+    )
+    print("实验功能：")
+    for feature, state in snapshot.get("experimental_features", {}).items():
+        enabled = "开启" if state.get("enabled") else "关闭"
+        print(
+            f"- {feature}：{enabled}；{state.get('capability', 'unprobed')}；"
+            f"{state.get('reason', '尚未探测')}"
+        )
+    print(
+        "最近实验状态查询："
+        f"{_format_timestamp(snapshot.get('last_experimental_query_at'))}"
     )
     terminal_query = snapshot.get("last_terminal_query_ok")
     terminal_query_label = (
@@ -256,7 +314,9 @@ def _doctor(paths: AppPaths) -> int:
     checks: list[tuple[str, bool, str]] = []
     checks.append(("macOS", platform.system() == "Darwin", platform.system()))
     bundled_codex = find_bundled_codex()
-    terminal_capability = _app_server_terminal_capability(bundled_codex)
+    terminal_capability, experimental_capabilities = _app_server_capabilities(
+        bundled_codex
+    )
     checks.append(
         (
             "App Server 终态读取",
@@ -306,6 +366,7 @@ def _doctor(paths: AppPaths) -> int:
             "SubagentStart",
             "SubagentStop",
             "PermissionRequest",
+            "PreToolUse",
         )
     }
     if paths.hooks_file.exists():
@@ -318,8 +379,15 @@ def _doctor(paths: AppPaths) -> int:
                     continue
                 hook_events_ok[event_name] = any(
                     (
-                        event_name != "PermissionRequest"
-                        or group.get("matcher") == ".*"
+                        (
+                            event_name == "PermissionRequest"
+                            and group.get("matcher") == ".*"
+                        )
+                        or (
+                            event_name == "PreToolUse"
+                            and group.get("matcher") == "^request_user_input$"
+                        )
+                        or event_name not in {"PermissionRequest", "PreToolUse"}
                     )
                     and _hook_handler_ok(handler, paths.runner, event_name)
                     for group in groups
@@ -339,7 +407,7 @@ def _doctor(paths: AppPaths) -> int:
                 if not hooks_enabled
                 else (
                     f"{paths.hooks_file}（SessionStart/UserPromptSubmit/SubagentStart/"
-                    "SubagentStop/PermissionRequest 均需在 /hooks 确认信任）"
+                    "SubagentStop/PermissionRequest/PreToolUse 均需在 /hooks 确认信任）"
                 )
             ),
         )
@@ -407,6 +475,16 @@ def _doctor(paths: AppPaths) -> int:
             install_state_detail,
         )
     )
+    for feature in EXPERIMENTAL_FEATURES:
+        capability = experimental_capabilities[feature]
+        checks.append(
+            (
+                f"实验能力 {feature}",
+                True,
+                ("available：" if capability.available else "unavailable：")
+                + capability.reason,
+            )
+        )
     legacy_launch_agent = getattr(paths, "legacy_launch_agent", None)
     legacy_exists = bool(
         legacy_launch_agent
@@ -509,7 +587,7 @@ def _doctor(paths: AppPaths) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "hook":
-        if args.event_name in {"PreToolUse", "Stop"}:
+        if args.event_name == "Stop":
             return 0
         return hook_main(args.event_name)
     if args.command == "notify":
@@ -557,6 +635,33 @@ def main(argv: list[str] | None = None) -> int:
             _configure()
         elif args.command == "doctor":
             return _doctor(AppPaths.default())
+        elif args.command == "experimental":
+            if args.experimental_command == "status":
+                capabilities = probe_experimental_capabilities(find_bundled_codex())
+                for feature, state in store.experimental_feature_status().items():
+                    enabled = "开启" if state["enabled"] else "关闭"
+                    capability = capabilities[feature]
+                    print(
+                        f"{feature}：{enabled}；"
+                        f"{'available' if capability.available else 'unavailable'}；"
+                        f"{capability.reason}"
+                    )
+            elif args.experimental_command == "enable":
+                capability = probe_experimental_capabilities(find_bundled_codex())[
+                    args.feature
+                ]
+                if not capability.available:
+                    raise ValueError(
+                        f"实验功能 {args.feature} 当前 unavailable：{capability.reason}"
+                    )
+                store.set_experimental_capability(
+                    args.feature, True, capability.reason
+                )
+                store.set_experimental_enabled(args.feature, True)
+                print(f"实验功能已开启：{args.feature}")
+            else:
+                store.set_experimental_enabled(args.feature, False)
+                print(f"实验功能已关闭：{args.feature}")
         elif args.command == "worker":
             run_once(store)
         return 0

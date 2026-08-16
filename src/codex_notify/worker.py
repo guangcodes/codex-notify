@@ -8,6 +8,7 @@ from typing import Any
 
 from .app_server_metadata import ThreadMetadata, read_pending_metadata
 from .app_server_status import TerminalStatus, read_terminal_status
+from .experimental_status import ExperimentalSnapshot, read_experimental_status
 from .constants import (
     DEFAULT_BATCH_SIZE,
     OUTBOX_RETENTION_SECONDS,
@@ -37,6 +38,10 @@ def run_once(
     ]
     | None = None,
     status_reader: Callable[[AppPaths, str, str], TerminalStatus | None] | None = None,
+    experimental_reader: Callable[
+        [AppPaths, set[str]], ExperimentalSnapshot
+    ]
+    | None = None,
 ) -> int:
     store = store or NotificationStore()
     metadata_turns: list[tuple[str, str]] | None = None
@@ -113,6 +118,19 @@ def run_once(
                 status = None
             store.record_terminal_probe(session_id, turn_id, status, now=now)
         store.finalize_aggregations(now=now, require_due_probe=True)
+        # Serialize the entire read-and-record window with ``off --now``.  If the
+        # read wins, immediate shutdown suppresses the resulting current state;
+        # if shutdown wins, the feature re-check below prevents a stale read.
+        with store.delivery_lock():
+            experimental_features = store.experimental_query_features(now=now)
+            if experimental_features:
+                store.mark_experimental_query_attempt(now=now)
+                try:
+                    reader = experimental_reader or read_experimental_status
+                    snapshot = reader(store.paths, experimental_features)
+                except Exception:
+                    snapshot = ExperimentalSnapshot()
+                store.record_experimental_snapshot(snapshot, now=now)
         if claimed == 0:
             deliver(
                 store.claim_due(

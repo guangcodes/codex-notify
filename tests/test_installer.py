@@ -238,6 +238,7 @@ class InstallerTests(unittest.TestCase):
             "SubagentStart",
             "SubagentStop",
             "PermissionRequest",
+            "PreToolUse",
         ):
             commands = [
                 handler["command"]
@@ -254,7 +255,12 @@ class InstallerTests(unittest.TestCase):
             permission_group["hooks"][0]["statusMessage"],
             "Queueing confirmed Codex permission notification",
         )
-        self.assertNotIn("PreToolUse", document["hooks"])
+        pretool_group = document["hooks"]["PreToolUse"][-1]
+        self.assertEqual(pretool_group["matcher"], "^request_user_input$")
+        self.assertEqual(
+            pretool_group["hooks"][0]["statusMessage"],
+            "Queueing best-effort Codex input notification",
+        )
         self.assertTrue(self.installer.paths.runner.exists())
         self.assertTrue(self.installer.launch_agent.exists())
         config = installer_module.tomllib.loads(
@@ -876,6 +882,30 @@ class InstallerTests(unittest.TestCase):
             self.installer.install(start_agent=False)
         with self.assertRaisesRegex(ValueError, "PreToolUse.*漂移"):
             self.installer.uninstall()
+
+    def test_install_upgrades_owned_legacy_bash_pretool_hook(self):
+        self.installer.install(start_agent=False)
+        document = json.loads(self.installer.hooks_file.read_text(encoding="utf-8"))
+        document["hooks"]["PreToolUse"] = [
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": self.installer._hook_command("PreToolUse"),
+                        "timeout": 5,
+                    }
+                ],
+            }
+        ]
+        self.installer.hooks_file.write_text(json.dumps(document), encoding="utf-8")
+
+        self.installer.install(start_agent=False)
+
+        upgraded = json.loads(self.installer.hooks_file.read_text(encoding="utf-8"))
+        groups = upgraded["hooks"]["PreToolUse"]
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["matcher"], "^request_user_input$")
 
     def test_hook_removal_does_not_rewrite_unrelated_configuration(self):
         original = self.installer.hooks_file.read_text(encoding="utf-8")

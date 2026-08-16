@@ -8,7 +8,13 @@ from pathlib import Path
 
 from codex_notify.constants import OUTBOX_RETENTION_SECONDS
 from codex_notify.app_server_status import TerminalStatus
-from codex_notify.db import HookEvent, NotificationStore, PermissionEvent, SubagentEvent
+from codex_notify.db import (
+    HookEvent,
+    NotificationStore,
+    PermissionEvent,
+    RequestUserInputEvent,
+    SubagentEvent,
+)
 from codex_notify.paths import AppPaths
 
 
@@ -253,6 +259,93 @@ class NotificationStoreTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual((row["session_id"], row["turn_id"]), ("session-1", "turn-1"))
         self.assertIn("子任务审批：MCP 工具审批", row["payload_json"])
+
+    def test_child_request_user_input_requires_exact_confirmed_root(self):
+        self.store.set_enabled(True, now=1)
+        self.store.set_experimental_capability("request-user-input", True, "fixture")
+        self.store.set_experimental_enabled("request-user-input", True)
+        self._start(now=10)
+        self.store.record_subagent_start(
+            SubagentEvent("child-session", "review", "session-1", "child-turn"),
+            now=16,
+        )
+        self.store.record_start(
+            HookEvent("child-session", "child-turn", "/work/example", prompt="child"),
+            now=17,
+        )
+        self.assertTrue(
+            self.store.record_request_user_input(
+                RequestUserInputEvent(
+                    "child-session", "child-turn", "request_user_input", "b" * 64
+                ),
+                now=18,
+            )
+        )
+        with self.store.managed_connection() as connection:
+            row = connection.execute(
+                "SELECT session_id, turn_id, payload_json FROM outbox "
+                "WHERE event_type='experimental_request_user_input'"
+            ).fetchone()
+        self.assertEqual((row["session_id"], row["turn_id"]), ("session-1", "turn-1"))
+        self.assertIn('"child_signal": true', row["payload_json"])
+
+    def test_unverified_root_suppresses_pending_request_user_input(self):
+        self.store.set_enabled(True, now=1)
+        self.store.set_experimental_capability("request-user-input", True, "fixture")
+        self.store.set_experimental_enabled("request-user-input", True)
+        self._start(now=10, finalize=False)
+        self.assertTrue(
+            self.store.record_request_user_input(
+                RequestUserInputEvent(
+                    "session-1", "turn-1", "request_user_input", "c" * 64
+                ),
+                now=11,
+            )
+        )
+
+        self.store.finalize_pending(now=15)
+
+        with self.store.managed_connection() as connection:
+            row = connection.execute(
+                "SELECT status, last_error FROM outbox "
+                "WHERE event_type='experimental_request_user_input'"
+            ).fetchone()
+        self.assertEqual(row["status"], "suppressed")
+        self.assertEqual(row["last_error"], "root identity was not confirmed")
+
+    def test_off_suppresses_request_user_input_waiting_for_root_confirmation(self):
+        self.store.set_enabled(True, now=1)
+        self.store.set_experimental_capability("request-user-input", True, "fixture")
+        self.store.set_experimental_enabled("request-user-input", True)
+        self._start(now=10, finalize=False)
+        self.assertTrue(
+            self.store.record_request_user_input(
+                RequestUserInputEvent(
+                    "session-1", "turn-1", "request_user_input", "d" * 64
+                ),
+                now=11,
+            )
+        )
+
+        self.store.set_enabled(False, now=12)
+        self.store.record_thread_metadata(
+            "session-1",
+            turn_id="turn-1",
+            app_thread_id="app-thread",
+            parent_thread_id=None,
+            source_kind="appServer",
+            now=15,
+        )
+        self.store.finalize_pending(now=15)
+
+        with self.store.managed_connection() as connection:
+            row = connection.execute(
+                "SELECT status, last_error FROM outbox "
+                "WHERE event_type='experimental_request_user_input'"
+            ).fetchone()
+        self.assertEqual(row["status"], "suppressed")
+        self.assertEqual(row["last_error"], "notifications disabled before root confirmation")
+        self.assertEqual(self.store.claim_due(limit=10, now=15), [])
 
     def test_permission_during_root_confirmation_waits_for_started_delivery(self):
         self.store.set_enabled(True, now=1)

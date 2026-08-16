@@ -28,7 +28,11 @@ from .computer_use import (
     decode_previous_notify,
     inspect_computer_use,
 )
-from .constants import HOOK_STATUS_PERMISSION, HOOK_STATUS_START
+from .constants import (
+    HOOK_STATUS_PERMISSION,
+    HOOK_STATUS_REQUEST_USER_INPUT,
+    HOOK_STATUS_START,
+)
 from .paths import AppPaths
 
 
@@ -55,8 +59,9 @@ CURRENT_HOOK_EVENTS = (
     "SubagentStart",
     "SubagentStop",
     "PermissionRequest",
+    "PreToolUse",
 )
-LEGACY_HOOK_EVENTS = ("PreToolUse", "Stop")
+LEGACY_HOOK_EVENTS = ("Stop",)
 OWNED_HOOK_EVENTS = CURRENT_HOOK_EVENTS + LEGACY_HOOK_EVENTS
 LEGACY_STOP_STATUS_MESSAGE = "Queueing Codex turn completion notification"
 
@@ -1224,9 +1229,13 @@ raise SystemExit(main())
                 handler["statusMessage"] = HOOK_STATUS_START
             elif event_name == "PermissionRequest":
                 handler["statusMessage"] = HOOK_STATUS_PERMISSION
+            elif event_name == "PreToolUse":
+                handler["statusMessage"] = HOOK_STATUS_REQUEST_USER_INPUT
             group: dict[str, Any] = {"hooks": [handler]}
             if event_name == "PermissionRequest":
                 group["matcher"] = ".*"
+            elif event_name == "PreToolUse":
+                group["matcher"] = "^request_user_input$"
             groups.append(group)
             hooks[event_name] = groups
 
@@ -2038,14 +2047,30 @@ raise SystemExit(main())
                                 handler, runner=self.paths.runner
                             )
                         )
-                        if not expected_current and not expected_legacy_stop:
+                        expected_legacy_pretool = (
+                            event_name == "PreToolUse"
+                            and _is_expected_legacy_pretool_hook(
+                                handler, runner=self.paths.runner
+                            )
+                        )
+                        if (
+                            not expected_current
+                            and not expected_legacy_stop
+                            and not expected_legacy_pretool
+                        ):
                             raise ValueError(
                                 f"现有 hooks.json 的 {event_name} codex-notify Hook 已漂移"
                             )
-                        if event_name == "PreToolUse" and group.get("matcher") != "Bash":
-                            raise ValueError(
-                                "现有 hooks.json 的 PreToolUse codex-notify Hook 已漂移"
+                        if event_name == "PreToolUse":
+                            expected_matcher = (
+                                "Bash"
+                                if expected_legacy_pretool
+                                else "^request_user_input$"
                             )
+                            if group.get("matcher") != expected_matcher:
+                                raise ValueError(
+                                    "现有 hooks.json 的 PreToolUse codex-notify Hook 已漂移"
+                                )
                         if (
                             event_name == "PermissionRequest"
                             and group.get("matcher") != ".*"
@@ -2837,7 +2862,19 @@ def is_expected_managed_hook(
         expected["statusMessage"] = HOOK_STATUS_START
     elif event_name == "PermissionRequest":
         expected["statusMessage"] = HOOK_STATUS_PERMISSION
+    elif event_name == "PreToolUse":
+        expected["statusMessage"] = HOOK_STATUS_REQUEST_USER_INPUT
     return item == expected
+
+
+def _is_expected_legacy_pretool_hook(item: Any, *, runner: Path) -> bool:
+    if not _is_our_hook(item, runner=runner, event_name="PreToolUse"):
+        return False
+    return item == {
+        "type": "command",
+        "command": item["command"],
+        "timeout": 5,
+    }
 
 
 def _is_expected_legacy_stop_hook(item: Any, *, runner: Path) -> bool:
