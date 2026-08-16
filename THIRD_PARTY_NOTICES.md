@@ -8,9 +8,10 @@
 codex-notify 当前没有 Python 运行时包依赖，`pyproject.toml` 中的 `dependencies` 为空。
 wheel 和 sdist 不包含、复制或 vendoring 第三方运行时代码。
 
-构建发行包需要 `setuptools>=77`。本地开发和 CI 还可能使用 `build`、`twine`、gitleaks
-及 GitHub Actions。这些工具只参与构建、检查或发布，不会作为 codex-notify 运行时代码
-安装到用户的私有 runtime；它们仍分别适用各自的许可证。
+构建发行包需要 `setuptools>=77`。用户可以选择 pipx 作为隔离安装工具；本地开发和 CI
+还可能使用 `build`、`twine`、gitleaks 及 GitHub Actions。这些工具只参与安装、构建、
+检查或发布，不会作为 codex-notify 运行时代码安装到用户的私有 runtime；它们仍分别适用
+各自的许可证。
 
 如果未来引入或复制第三方代码、字体、图像、二进制文件或数据，贡献者必须同时更新
 依赖元数据、本文件和必要的许可证文本，不能只修改安装脚本。

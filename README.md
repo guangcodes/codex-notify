@@ -6,13 +6,14 @@
 
 本项目由社区独立维护，不是 OpenAI 或飞书官方产品。
 
-## 为什么需要 codex-notify
+## 文档导航
 
-Codex 执行长时间任务时，用户可能已经离开电脑。任务完成后，如果没有主动提醒，用户往往不能及时回来确认结果或推进下一步工作。
-
-ChatGPT Remote 可以用于远程查看和操作电脑上的任务；codex-notify 则补充移动端主动通知能力。当用户不在电脑旁时，它会通过飞书发送 Codex Turn 的启动和完成消息，让用户及时了解任务进度并响应后续工作。
-
-codex-notify 不提供远程控制能力，也不替代 ChatGPT Remote。它只负责可靠地把任务状态推送到用户已有的移动消息渠道。
+- [更新日志](https://github.com/guangcodes/codex-notify/blob/main/CHANGELOG.md)：已发布版本与未发布变更。
+- [GitHub Releases](https://github.com/guangcodes/codex-notify/releases)：每个 tag 的发布说明和构建产物。
+- [安全策略](https://github.com/guangcodes/codex-notify/blob/main/SECURITY.md)：支持版本、私密漏洞报告入口和信任边界。
+- [参与贡献](https://github.com/guangcodes/codex-notify/blob/main/CONTRIBUTING.md)：支持契约、验证要求和发布文档同步规则。
+- [第三方与商标声明](https://github.com/guangcodes/codex-notify/blob/main/THIRD_PARTY_NOTICES.md)：发行包、外部依赖、服务和商标边界。
+- [v0.1.0 发布验收记录](https://github.com/guangcodes/codex-notify/blob/main/docs/release-acceptance-v0.1.0.md)：首个公开版本的历史实机与产物证据；不代表后续版本的当前行为。
 
 ## 事件链
 
@@ -63,7 +64,7 @@ agent-turn-complete ─────────→ 唯一权威完成事件
 (session_id, turn_id, "completed")
 ```
 
-SQLite 发件队列保证本地幂等、启动/完成顺序、失败重试和 24 小时保留边界。消息在落库前会脱敏和截断。
+SQLite 发件队列保证本地幂等、启动/完成顺序和失败重试。未发送项超过 24 小时后会标记为永久失败；消息在落库前会脱敏和截断。
 
 ## 依赖与兼容性
 
@@ -72,32 +73,40 @@ codex-notify 只支持当前 macOS 用户级部署，不支持 Linux、Windows�
 | 类型 | 依赖 | 要求与用途 |
 | --- | --- | --- |
 | 操作系统 | macOS | 使用当前用户的 Keychain 和 `launchd`/LaunchAgent；集成安装器只写当前用户目录，不调用 `sudo`。 |
-| Python | Python 3.11 或更高版本 | 用于安装 CLI；私有 runtime 会绑定一个可长期使用的基础解释器，不依赖安装时的 venv、pipx 环境或源码目录。 |
+| Python | Python 3.11、3.12 或 3.13 | 包元数据允许 Python 3.11 及更高版本安装；发布 CI 实际覆盖 3.11–3.13。更高版本需单独验证。私有 runtime 不依赖安装时的 venv、pipx 环境或源码目录。 |
 | Codex 集成 | Codex Computer Use | 强制外部依赖。必须已安装并启用，保持顶层 `notify` 所有权，并通过签名身份和 `--previous-notify` 能力检查。项目不固定锁死 Computer Use 版本号。 |
 | 消息服务 | 启用签名校验的飞书自定义机器人 | 用户需要准备 Webhook URL 和签名密钥；当前不支持其他机器人或消息平台。 |
 | Python 运行依赖 | 无 | `pyproject.toml` 的 `dependencies` 为空，运行时代码只使用 Python 标准库。`setuptools>=77` 仅用于构建发行包。 |
 
-Computer Use、Codex、飞书及其服务不随本项目分发，分别受其提供方的许可、账号和服务条款约束。项目发行包只包含 codex-notify 自身源码和许可证，详见[第三方与商标声明](THIRD_PARTY_NOTICES.md)。
+Computer Use、Codex、飞书及其服务不随本项目分发，分别受其提供方的许可、账号和服务条款约束。项目发行包只包含 codex-notify 自身源码和许可证，详见[第三方与商标声明](https://github.com/guangcodes/codex-notify/blob/main/THIRD_PARTY_NOTICES.md)。
 
 ## 安装、部署与配置
 
 ### 1. 安装 Python 包
 
-推荐从 PyPI 安装：
+推荐使用 [pipx](https://pipx.pypa.io/) 从 PyPI 安装 CLI，使它与系统 Python 和其他项目环境隔离：
+
+```bash
+pipx install --python python3.13 codex-notify
+```
+
+示例使用 Python 3.13；也可以将 `python3.13` 替换为本机可用的 Python 3.11 或 3.12。
+
+也可以在已激活的虚拟环境中使用 pip：
 
 ```bash
 python3 -m pip install codex-notify
 ```
 
-也可以从源码安装，后续生命周期与 PyPI 包完全相同：
+从源码安装时同样建议使用 pipx 或已激活的虚拟环境；后续集成生命周期与 PyPI 包相同：
 
 ```bash
 git clone https://github.com/guangcodes/codex-notify.git
 cd codex-notify
-python3 -m pip install .
+pipx install --python python3.13 .
 ```
 
-`pip install` 只安装由包管理器拥有的 `codex-notify` 命令，不会修改 Codex 配置或 macOS 服务。
+`pipx install` 或 `pip install` 只安装由包管理器拥有的 `codex-notify` 命令，不会修改 Codex 配置或 macOS 服务。
 
 ### 2. 部署用户级集成
 
@@ -155,38 +164,39 @@ codex-notify status
 python3 -m codex_notify.cli install
 ```
 
-迁移完成后统一使用 `codex-notify`；后续升级执行：
+迁移完成后统一使用 `codex-notify`。如果最初从 PyPI 使用 pipx 安装，后续升级执行：
+
+```bash
+pipx upgrade codex-notify
+codex-notify install
+```
+
+如果使用虚拟环境中的 pip，则将第一条替换为：
 
 ```bash
 python3 -m pip install --upgrade codex-notify
+```
+
+如果使用 `pipx install .` 从源码 checkout 安装，pipx 会记录该 checkout 的绝对路径；升级前
+必须先刷新源码，再按原始来源重建 pipx 环境：
+
+```bash
+git pull --ff-only
+pipx reinstall --python python3.13 codex-notify
+codex-notify install
+```
+
+若源码目录已删除或希望改回 PyPI 发行包，应重新建立来源：
+
+```bash
+pipx uninstall codex-notify
+pipx install --python python3.13 codex-notify
 codex-notify install
 ```
 
 升级 Python 包后必须再次执行 `codex-notify install`，把同版本 runtime 发布到私有运行目录。Computer Use 必须保持顶层 `notify` 所有权，codex-notify 只通过其原生 `--previous-notify` 链式能力接入。安装器接受签名身份匹配且能力探测通过的 Computer Use 版本；签名异常版本只接受内置的精确摘要白名单，其他情况失败关闭。
 
 安装器使用当前用户的主目录，不依赖固定用户名、固定主目录、私有 Skill、虚拟环境或第三方提示词模板。升级时会精确移除旧版归属的 Hook、CLI shim 和 LaunchAgent，保留其他程序的配置。
-
-## 诊断与状态
-
-```bash
-codex-notify status
-codex-notify doctor
-```
-
-`status` 显示开关、运行中 Turn、待分类候选、发件队列、永久失败和最近投递状态。
-
-`doctor` 检查：
-
-- macOS 与运行入口
-- Keychain 凭据
-- 四个当前 Hook 的精确命令和元数据
-- Computer Use 身份及 `--previous-notify` 能力
-- `install-state.json` 与通知链一致性
-- 当前包、私有运行环境与安装状态版本一致性
-- LaunchAgent 配置及加载状态
-- 旧 LaunchAgent 是否残留
-
-`doctor` 不检查已移除的启动器、HMAC 意图或私有审查器数据库结构。`/hooks` 的人工信任仍需单独确认。
 
 ## 卸载
 
@@ -197,7 +207,14 @@ codex-notify uninstall --purge
 
 普通卸载精确移除本项目拥有的 Hook、Computer Use 通知链、LaunchAgent 和私有运行环境，同时保留 SQLite 数据与日志。它不会删除由 pip 或 pipx 管理的 `codex-notify` 命令。旧数据库中的废弃兼容数据保持不活动状态，不会在普通启动或卸载时执行破坏性的 `DROP`。`--purge` 按既有语义删除全部运行数据。
 
-应先卸载集成，再卸载 Python 包：
+应先卸载集成，再按最初的包管理方式卸载 Python 包。使用 pipx 安装时执行：
+
+```bash
+codex-notify uninstall
+pipx uninstall codex-notify
+```
+
+使用已激活虚拟环境中的 pip 安装时执行：
 
 ```bash
 codex-notify uninstall
@@ -214,23 +231,9 @@ python3 ~/.codex/codex-notify/runner.py uninstall
 
 ## 隐私与本地数据
 
-发送到飞书的消息包含项目名称、用户任务摘要、父 Turn 最终结果、已确认子 Turn 的结构化结果、时间、耗时、短 Turn ID 和事件 ID。摘要在进入 SQLite 前经过敏感格式检测、整段替换和长度截断，但正则脱敏不能保证识别所有业务机密；不要在高敏感项目中启用通知。App Server 的响应、preview、prompt、cwd 和消息 Item 不会保存。
+发送到飞书的消息包含项目名称、用户任务摘要、父 Turn 最终结果、已确认子 Turn 的结构化结果、时间、耗时、短 Turn ID 和事件 ID。摘要在进入 SQLite 前经过敏感格式检测、整段替换和长度截断，但正则脱敏不能保证识别所有业务机密；不要在高敏感项目中启用通知。App Server 响应原文、preview、prompt、cwd 和消息 Item 不会保存；从 App Server 校准结果中只提取关系判断所需的 Thread/Turn 身份、来源和时间元数据，并将分类结果写入 SQLite。
 
-飞书 Webhook 和签名密钥只保存在当前用户的 macOS Keychain。运行数据位于 `~/.codex/codex-notify/`，SQLite 与日志仅对当前用户开放。发件队列最长保留 24 小时；飞书已接收而本地未收到确认时，重试可能产生相同事件 ID 的重复消息。普通卸载保留数据，只有 `--purge` 删除运行数据。
-
-## 开发验证
-
-```bash
-PYTHONPATH=src python3 -m unittest discover -s tests -v
-python3 -m compileall -q src scripts tests
-git diff --check
-python3 -m build
-```
-
-自动测试证明源码状态机、SQLite 迁移、安装器模拟、Computer Use 链、Keychain、发件队列、重试和并发规则；它不能证明真实 Hook 信任、真实用户/子 Turn、真实飞书投递、目标 Mac 生命周期或离线重试恢复。
-
-`v0.1.0` 的发布产物、目标 Mac 集成和真实飞书链路证据见
-[发布验收记录](docs/release-acceptance-v0.1.0.md)。记录会明确区分真实验证、自动化验证和未重新执行项。
+飞书 Webhook 和签名密钥只保存在当前用户的 macOS Keychain。运行数据位于 `~/.codex/codex-notify/`，SQLite 与日志仅对当前用户开放。未发送项最多重试 24 小时，超过期限后在 SQLite 中标记为永久失败；飞书已接收而本地未收到确认时，重试可能产生相同事件 ID 的重复消息。普通卸载保留 SQLite 与日志，只有 `uninstall --purge` 删除运行数据。
 
 ## 已知边界
 
@@ -241,18 +244,10 @@ python3 -m build
 - 飞书若已经接收请求但本地未收到确认，重试可能产生带相同事件 ID 的重复消息。
 - 当前实现依赖 macOS Keychain 和 LaunchAgent。
 
-官方字段说明见 [Codex Hooks](https://developers.openai.com/codex/config-advanced#hooks) 和 [Codex Notifications](https://developers.openai.com/codex/config-advanced#notifications)。
+官方契约说明见 [Codex Hooks](https://learn.chatgpt.com/docs/hooks)、
+[Codex Notifications](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications) 和
+[Codex App Server](https://learn.chatgpt.com/docs/app-server)。
 
-## 许可、版权与第三方权利
+## 许可与第三方声明
 
-除非具体文件另有说明，本项目源码和随附文档的版权声明为：
-
-```text
-Copyright (c) 2026 guangcodes
-```
-
-项目依据 [MIT License](LICENSE) 开源。MIT 许可证允许使用、复制、修改、合并、发布、分发、再许可和销售软件副本，但所有副本或软件的重要部分必须保留原版权声明和许可声明。软件按“原样”提供，不附带任何明示或默示担保；完整且具有约束力的条款以英文 `LICENSE` 文件为准。
-
-MIT 许可证仅适用于本仓库实际发布的 codex-notify 代码和文档，不会改变 Computer Use、Codex、飞书、GitHub、PyPI 或其他外部软件与服务的许可和服务条款。本项目由社区独立维护，不是 OpenAI 或飞书官方产品，也不表示相关权利人对本项目提供背书。
-
-项目当前没有打包、复制或 vendoring 第三方运行时代码；构建、测试和外部服务边界见[第三方与商标声明](THIRD_PARTY_NOTICES.md)。OpenAI、Codex、飞书及文档中出现的其他产品名称、标识和商标归各自权利人所有。
+本项目依据 [MIT License](https://github.com/guangcodes/codex-notify/blob/main/LICENSE) 开源。外部软件、服务、依赖和商标边界见[第三方与商标声明](https://github.com/guangcodes/codex-notify/blob/main/THIRD_PARTY_NOTICES.md)。
