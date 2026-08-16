@@ -3,8 +3,8 @@
 本文记录第二切片“尽力通知与实验性只读状态查询”的能力门。结论基于当前官方
 [Codex Hooks](https://learn.chatgpt.com/docs/hooks)、
 [Codex App Server](https://learn.chatgpt.com/docs/app-server) 和目标 Mac bundled Codex
-生成的 experimental JSON schema。schema 探测是静态操作；本切片没有连接真实 MCP、
-调用 OAuth、消费额度或发送真实飞书消息。
+生成的 experimental JSON schema。初始实现门控没有连接真实 MCP、调用 OAuth、消费额度
+或发送真实飞书消息；目标 Mac 的后续本地验收单独记录在本文末尾。
 
 ## 统一安全边界
 
@@ -19,7 +19,7 @@
 
 | 候选事件 | 公开协议形态 | 独立子进程能否观察原 Desktop Turn | 持久只读状态 / Turn 关联 | 结论 |
 | --- | --- | --- | --- | --- |
-| `request_user_input` | `PreToolUse` 可按本地函数 `tool_name` 精确正则匹配；App Server 另有实时 server request | Hook 可提供当前 `session_id + turn_id`；不依赖独立 App Server 实时连接 | 只接受已确认根 Turn，或精确关联到根的已确认子 Turn | **implemented**：matcher `^request_user_input$`，通用文案，不读取问题正文；真实 Hook 触发与 `/hooks` 信任仍待实机验收 |
+| `request_user_input` | `PreToolUse` 可按本地函数 `tool_name` 精确正则匹配；App Server 另有实时 server request | Hook 可提供当前 `session_id + turn_id`；不依赖独立 App Server 实时连接 | 只接受已确认根 Turn，或精确关联到根的已确认子 Turn | **implemented / trusted-on-target-mac**：matcher `^request_user_input$`，通用文案，不读取问题正文；六个 Hook 已在目标 Mac 信任并激活，真实 `request_user_input` 触发仍待单独验收 |
 | MCP 登录状态 | `mcpServerStatus/list` read API，`toolsAndAuthOnly`，结构化 `authStatus` | 不依赖原 Turn；按全局状态处理 | `notLoggedIn` 明确进入时一次，健康状态后允许未来再次通知 | **implemented / deferred-real-validation**：mock 与 schema 已验证；真实 MCP 是否会被初始化、是否完全无副作用仍待单独授权验收 |
 | 账户限流 | `account/rateLimits/read` read API，结构化 `rateLimitReachedType` | 不依赖原 Turn；按账户级全局状态处理 | reached 转换通知；同窗口冷却；恢复后等待新的窗口身份 | **implemented / deferred-real-validation**：mock 与 schema 已验证；真实调用是否产生网络请求及账户行为仍待单独授权验收 |
 | MCP form elicitation | `mcpServer/elicitation/request` server request | 否；只发给承载原 Turn 的 host 连接 | 可能有 thread/turn correlation，但没有安全的独立持久 read API | **unavailable** |
@@ -57,3 +57,14 @@ Turn 级信号依赖对应 started 事件成功发送。全局 MCP/账户状态�
 本地自动化证明 mock Hook、mock App Server、schema 兼容、SQLite 迁移、状态转换、幂等、
 冷却、安装/卸载和失败开放。它不证明真实 Hook 会触发、Hook 已被用户信任、真实 MCP 查询
 无副作用、rate-limit read 不联网，或真实飞书已经收到实验通知。
+
+## 目标 Mac v0.1.3 发布前验收（2026-08-16）
+
+- Python 3.13 pipx 环境、CLI 和私有 runtime 均安装为 `0.1.3`；LaunchAgent 已加载。
+- `codex-notify doctor` 通过，三个实验 capability 均为 `available` 且保持默认关闭。
+- Codex `/hooks` 已逐项核对：`SessionStart`、`UserPromptSubmit`、`SubagentStart`、
+  `SubagentStop`、`PermissionRequest` 和精确 matcher 的 `PreToolUse` 均为 active。
+- `codex-notify test` 已向现有飞书机器人成功发送显式测试消息；随后队列待发送/重试和永久失败均为 0。
+- 这组证据证明本地安装、Hook 信任、通知链和普通飞书投递可用；未启用或触发三个实验功能，
+  因而不证明真实 `request_user_input`、MCP 登录状态或账户限流通知已经端到端送达。
+- 本节记录的是发布前本地源码安装，不等同于 GitHub Release、PyPI 产物或发布后全新环境安装证据。
