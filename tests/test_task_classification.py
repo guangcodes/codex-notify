@@ -389,7 +389,7 @@ class TurnStateTests(unittest.TestCase):
             legacy_table = connection.execute(
                 "SELECT name FROM sqlite_master WHERE name='managed_launchers'"
             ).fetchone()
-        self.assertEqual(version, 7)
+        self.assertEqual(version, 8)
         self.assertEqual(turn["classification"], "NOTIFIABLE_ROOT")
         self.assertEqual(turn["lifecycle"], "COMPLETED")
         self.assertEqual(turn["terminal_status"], "completed")

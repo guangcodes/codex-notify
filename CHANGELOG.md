@@ -4,6 +4,13 @@
 
 ## 未发布
 
+- 新增默认关闭的 best-effort 实验通知：精确 `request_user_input` PreToolUse、MCP `notLoggedIn` 全局状态和账户 `rateLimitReachedType` 全局状态。
+- 新增 `codex-notify experimental status|enable|disable`，总开关保持权威；`off --now` 永久抑制当前实验 outbox 和已观察状态。
+- SQLite 升级到 v8，增加实验 capability、可信度、信号来源/类型、安全信号 ID、状态转换、冷却和最近成功查询状态；迁移保持可重复且不重放历史事件。
+- 增加一次性受限实验 App Server 查询：共享非阻塞锁、5 秒超时、1 MiB 输出上限、独立频率限制、严格 schema/pagination 校验；实验失败不阻塞终态扫描。
+- 安装器新增精确 `^request_user_input$` PreToolUse matcher，并安全迁移旧版自有 Bash PreToolUse；doctor/status 显示实验 capability、开关和 best_effort 统计。
+- 新增实验能力证据矩阵，明确 MCP elicitation、Connector 确认、model verification、直接 OAuth/重新认证、外部页面、验证码与 MFA 当前不可观察。
+
 - 新增确定的 `PermissionRequest` 审批通知：严格根/子 Turn 归属、失败关闭、稳定幂等、通用操作分类和入库前脱敏；Hook 永不返回 allow/deny，也不保存原始 payload。
 - 新增一次性只读 `thread/turns/list(itemsView="notLoaded")` 终态读取，校准 `completed`、`failed`、`interrupted`，拒绝非空 Items、未知状态/字段、超时、超大输出和身份冲突。
 - 新增有界终态补偿扫描、查询退避、24 小时停止、App Server 单实例锁，以及 `agent-turn-complete` 校准窗口后的 completed 兼容回退。

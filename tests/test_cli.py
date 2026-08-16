@@ -4,13 +4,14 @@ import plistlib
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from codex_notify import __version__
 from codex_notify.cli import (
+    _app_server_capabilities,
     _app_server_terminal_capability,
     _configure,
     _doctor,
@@ -19,7 +20,12 @@ from codex_notify.cli import (
     main,
 )
 from codex_notify.computer_use import ComputerUseIntegration, encode_previous_notify
-from codex_notify.constants import HOOK_STATUS_PERMISSION, HOOK_STATUS_START
+from codex_notify.constants import (
+    HOOK_STATUS_PERMISSION,
+    HOOK_STATUS_REQUEST_USER_INPUT,
+    HOOK_STATUS_START,
+)
+from codex_notify.experimental_status import ExperimentalCapability
 from codex_notify.installer import LEGACY_LAUNCH_AGENT_LABEL
 from codex_notify.keychain import FeishuCredentials
 
@@ -28,8 +34,10 @@ class CliTests(unittest.TestCase):
     def test_legacy_hooks_are_accepted_as_noops(self):
         with patch("codex_notify.cli.NotificationStore") as store:
             self.assertEqual(main(["hook", "Stop"]), 0)
-            self.assertEqual(main(["hook", "PreToolUse"]), 0)
         store.assert_not_called()
+        with patch("codex_notify.cli.hook_main", return_value=0) as hook_main:
+            self.assertEqual(main(["hook", "PreToolUse"]), 0)
+        hook_main.assert_called_once_with("PreToolUse")
 
     def test_install_command_uses_the_installed_package_directory(self):
         with (
@@ -185,6 +193,32 @@ class CliTests(unittest.TestCase):
         with patch("codex_notify.cli.subprocess.run", side_effect=generate):
             self.assertFalse(_app_server_terminal_capability(Path("/codex")))
 
+    def test_app_server_capabilities_generate_schema_once(self):
+        capabilities = {
+            feature: ExperimentalCapability(True, "fixture")
+            for feature in ("request-user-input", "mcp-auth", "rate-limits")
+        }
+        with (
+            patch(
+                "codex_notify.cli._app_server_terminal_capability_from_schema",
+                return_value=True,
+            ) as terminal_parser,
+            patch(
+                "codex_notify.cli.read_experimental_capabilities",
+                return_value=capabilities,
+            ) as experimental_parser,
+            patch(
+                "codex_notify.cli.subprocess.run", return_value=Mock(returncode=0)
+            ) as run,
+        ):
+            terminal, experimental = _app_server_capabilities(Path("/codex"))
+
+        self.assertTrue(terminal)
+        self.assertEqual(experimental, capabilities)
+        run.assert_called_once()
+        terminal_parser.assert_called_once()
+        experimental_parser.assert_called_once()
+
     def test_hook_handler_requires_command_type(self):
         with tempfile.TemporaryDirectory() as directory:
             runner = Path(directory) / "runner.py"
@@ -257,6 +291,93 @@ class CliTests(unittest.TestCase):
         store.set_enabled.assert_called_once_with(True)
         self.assertIn("已确认的用户根 Turn", output.getvalue())
         self.assertNotIn("每个 Codex Turn", output.getvalue())
+
+    def test_experimental_enable_probes_capability_and_remains_independent(self):
+        store = Mock()
+        capabilities = {
+            feature: ExperimentalCapability(True, "fixture")
+            for feature in ("request-user-input", "mcp-auth", "rate-limits")
+        }
+        with (
+            patch("codex_notify.cli.NotificationStore", return_value=store),
+            patch(
+                "codex_notify.cli.probe_experimental_capabilities",
+                return_value=capabilities,
+            ),
+            patch("codex_notify.cli.find_bundled_codex", return_value=Path("/codex")),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(
+                main(["experimental", "enable", "request-user-input"]), 0
+            )
+        store.set_enabled.assert_not_called()
+        store.set_experimental_enabled.assert_called_once_with(
+            "request-user-input", True
+        )
+        store.set_experimental_capability.assert_called_once_with(
+            "request-user-input", True, "fixture"
+        )
+
+    def test_experimental_enable_probe_failure_preserves_existing_state(self):
+        store = Mock()
+        capabilities = {
+            feature: ExperimentalCapability(
+                feature != "mcp-auth", "fixture" if feature != "mcp-auth" else "transient"
+            )
+            for feature in ("request-user-input", "mcp-auth", "rate-limits")
+        }
+        with (
+            patch("codex_notify.cli.NotificationStore", return_value=store),
+            patch(
+                "codex_notify.cli.probe_experimental_capabilities",
+                return_value=capabilities,
+            ),
+            patch("codex_notify.cli.find_bundled_codex", return_value=Path("/codex")),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(main(["experimental", "enable", "mcp-auth"]), 1)
+
+        store.set_experimental_capability.assert_not_called()
+        store.set_experimental_enabled.assert_not_called()
+
+    def test_experimental_status_probe_is_read_only(self):
+        store = Mock()
+        store.experimental_feature_status.return_value = {
+            feature: {"enabled": feature == "mcp-auth"}
+            for feature in ("request-user-input", "mcp-auth", "rate-limits")
+        }
+        capabilities = {
+            feature: ExperimentalCapability(False, "transient")
+            for feature in ("request-user-input", "mcp-auth", "rate-limits")
+        }
+        output = io.StringIO()
+        with (
+            patch("codex_notify.cli.NotificationStore", return_value=store),
+            patch(
+                "codex_notify.cli.probe_experimental_capabilities",
+                return_value=capabilities,
+            ),
+            patch("codex_notify.cli.find_bundled_codex", return_value=Path("/codex")),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(main(["experimental", "status"]), 0)
+
+        store.set_experimental_capability.assert_not_called()
+        store.set_experimental_enabled.assert_not_called()
+        self.assertIn("mcp-auth：开启；unavailable；transient", output.getvalue())
+
+    def test_experimental_disable_does_not_probe_or_change_total_switch(self):
+        store = Mock()
+        with (
+            patch("codex_notify.cli.NotificationStore", return_value=store),
+            patch("codex_notify.cli.probe_experimental_capabilities") as probe,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(main(["experimental", "disable", "mcp-auth"]), 0)
+        probe.assert_not_called()
+        store.set_experimental_enabled.assert_called_once_with("mcp-auth", False)
+        store.set_enabled.assert_not_called()
 
     def test_doctor_rejects_marker_strings_and_unloaded_launch_agent(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -406,7 +527,11 @@ class CliTests(unittest.TestCase):
                                     **(
                                         {"matcher": ".*"}
                                         if event_name == "PermissionRequest"
-                                        else {}
+                                        else (
+                                            {"matcher": "^request_user_input$"}
+                                            if event_name == "PreToolUse"
+                                            else {}
+                                        )
                                     ),
                                     "hooks": [
                                         {
@@ -500,7 +625,11 @@ class CliTests(unittest.TestCase):
                                     **(
                                         {"matcher": ".*"}
                                         if event_name == "PermissionRequest"
-                                        else {}
+                                        else (
+                                            {"matcher": "^request_user_input$"}
+                                            if event_name == "PreToolUse"
+                                            else {}
+                                        )
                                     ),
                                     "hooks": [
                                         {
@@ -516,7 +645,11 @@ class CliTests(unittest.TestCase):
                                                 else (
                                                     {"statusMessage": HOOK_STATUS_PERMISSION}
                                                     if event_name == "PermissionRequest"
-                                                    else {}
+                                                    else (
+                                                        {"statusMessage": HOOK_STATUS_REQUEST_USER_INPUT}
+                                                        if event_name == "PreToolUse"
+                                                        else {}
+                                                    )
                                                 )
                                             ),
                                         }
@@ -529,6 +662,7 @@ class CliTests(unittest.TestCase):
                                 "SubagentStart",
                                 "SubagentStop",
                                 "PermissionRequest",
+                                "PreToolUse",
                             )
                         }
                     }
@@ -634,8 +768,15 @@ class CliTests(unittest.TestCase):
                     ),
                 ),
                 patch(
-                    "codex_notify.cli._app_server_terminal_capability",
-                    return_value=True,
+                    "codex_notify.cli._app_server_capabilities",
+                    return_value=(True, {
+                        feature: ExperimentalCapability(True, "fixture")
+                        for feature in (
+                            "request-user-input",
+                            "mcp-auth",
+                            "rate-limits",
+                        )
+                    }),
                 ),
                 patch("codex_notify.cli.subprocess.run") as run,
                 redirect_stdout(io.StringIO()),

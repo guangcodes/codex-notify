@@ -183,6 +183,44 @@ class HookTests(unittest.TestCase):
         with self.store.managed_connection() as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
 
+    def test_request_user_input_is_exact_best_effort_and_does_not_store_questions(self):
+        self.store.set_experimental_capability("request-user-input", True, "schema")
+        self.store.set_experimental_enabled("request-user-input", True)
+        self.store.record_start(
+            self.store_event("session", "turn", "/projects/demo"), now=10
+        )
+        self.store.record_thread_metadata(
+            "session",
+            turn_id="turn",
+            app_thread_id="thread-app",
+            parent_thread_id=None,
+            source_kind="appServer",
+            now=15,
+        )
+        self.store.finalize_pending(now=15)
+        sensitive = "QUESTION-SECRET-MARKER"
+        payload = {
+            "session_id": "session",
+            "turn_id": "turn",
+            "tool_name": "request_user_input",
+            "tool_use_id": "item-1",
+            "tool_input": {"questions": [{"question": sensitive, "options": []}]},
+        }
+        process_hook("PreToolUse", payload, self.store)
+        process_hook("PreToolUse", payload, self.store)
+        process_hook("PreToolUse", {**payload, "tool_name": "other_tool"}, self.store)
+
+        with self.store.managed_connection() as connection:
+            rows = connection.execute(
+                "SELECT event_type, payload_json FROM outbox ORDER BY id"
+            ).fetchall()
+        self.assertEqual(
+            [row["event_type"] for row in rows],
+            ["started", "experimental_request_user_input"],
+        )
+        self.assertNotIn(sensitive, self.store.paths.database.read_bytes().decode("utf-8", "ignore"))
+        self.assertIn('"certainty": "best_effort"', rows[-1]["payload_json"])
+
     @staticmethod
     def store_event(session_id, turn_id, cwd):
         from codex_notify.db import HookEvent

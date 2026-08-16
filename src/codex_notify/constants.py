@@ -7,6 +7,7 @@ KEYCHAIN_WEBHOOK_SERVICE = "codex-notify-feishu-webhook"
 KEYCHAIN_SECRET_SERVICE = "codex-notify-feishu-signing-secret"
 HOOK_STATUS_START = "Queueing Codex turn start notification"
 HOOK_STATUS_PERMISSION = "Queueing confirmed Codex permission notification"
+HOOK_STATUS_REQUEST_USER_INPUT = "Queueing best-effort Codex input notification"
 PENDING_CONFIRMATION_SECONDS = 5
 FINAL_AGGREGATION_SECONDS = 5
 TERMINAL_CALIBRATION_SECONDS = 5

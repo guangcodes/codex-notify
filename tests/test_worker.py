@@ -7,6 +7,8 @@ from pathlib import Path
 from codex_notify.app_server_metadata import ThreadMetadata
 from codex_notify.app_server_status import TerminalStatus
 from codex_notify.db import HookEvent, NotificationStore, PermissionEvent
+from codex_notify.experimental_status import ExperimentalSnapshot
+from codex_notify.experimental_status import McpAuthObservation
 from codex_notify.feishu import DeliveryError
 from codex_notify.paths import AppPaths
 from codex_notify.worker import run_once
@@ -38,6 +40,20 @@ def _run_blocking_worker(root, started, release):
     store = NotificationStore(AppPaths(Path(root)))
     client = _BlockingClient(started, release)
     run_once(store, client_factory=lambda: client, now=100)
+
+
+def _run_blocking_experimental_reader(root, started, release):
+    store = NotificationStore(AppPaths(Path(root)))
+
+    def reader(_paths, _features):
+        started.set()
+        if not release.wait(5):
+            raise TimeoutError("test did not release experimental reader")
+        return ExperimentalSnapshot(
+            mcp_auth=(McpAuthObservation.from_name("calendar", "notLoggedIn"),)
+        )
+
+    run_once(store, now=100, experimental_reader=reader)
 
 
 class WorkerTests(unittest.TestCase):
@@ -368,6 +384,48 @@ class WorkerTests(unittest.TestCase):
                 process.terminate()
                 process.join(2)
 
+    def test_immediate_off_suppresses_inflight_experimental_observation(self):
+        self.store.set_enabled(True, now=90)
+        self.store.set_experimental_capability("mcp-auth", True, "fixture", now=90)
+        self.store.set_experimental_enabled("mcp-auth", True, now=90)
+        context = multiprocessing.get_context("fork")
+        started = context.Event()
+        release = context.Event()
+        process = context.Process(
+            target=_run_blocking_experimental_reader,
+            args=(str(self.store.paths.root), started, release),
+        )
+        process.start()
+        try:
+            self.assertTrue(started.wait(2), "worker never entered experimental reader")
+            off_finished = threading.Event()
+
+            def turn_off():
+                self.store.set_enabled(False, immediate=True, now=101)
+                off_finished.set()
+
+            thread = threading.Thread(target=turn_off)
+            thread.start()
+            self.assertFalse(
+                off_finished.wait(0.1), "off --now did not wait for experimental read"
+            )
+            release.set()
+            thread.join(2)
+            self.assertTrue(off_finished.is_set())
+            process.join(2)
+            self.assertEqual(process.exitcode, 0)
+            self.store.set_enabled(True, now=102)
+            snapshot = ExperimentalSnapshot(
+                mcp_auth=(McpAuthObservation.from_name("calendar", "notLoggedIn"),)
+            )
+            self.assertEqual(self.store.record_experimental_snapshot(snapshot, now=103), 0)
+        finally:
+            release.set()
+            process.join(2)
+            if process.is_alive():
+                process.terminate()
+                process.join(2)
+
     def test_explicit_test_bypasses_immediate_pause(self):
         self.store.set_enabled(True, now=90)
         self.store.set_enabled(False, immediate=True, now=91)
@@ -377,6 +435,46 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(self.store.event_status(key), "sent")
         self.assertFalse(self.store.is_enabled())
         self.assertTrue(self.store.is_delivery_paused())
+
+    def test_terminal_scan_runs_before_experimental_query_and_failure_is_isolated(self):
+        self.store.set_enabled(True, now=90)
+        self.store.set_experimental_capability("mcp-auth", True, "fixture", now=90)
+        self.store.set_experimental_enabled("mcp-auth", True, now=90)
+        self.store.record_start(
+            HookEvent("session", "turn", "/work/example", prompt="work"), now=100
+        )
+        self.store.record_thread_metadata(
+            "session",
+            turn_id="turn",
+            app_thread_id="app-thread",
+            parent_thread_id=None,
+            source_kind="appServer",
+            now=105,
+        )
+        self.store.finalize_pending(now=105)
+        order = []
+
+        def terminal_reader(_paths, _thread, _turn):
+            order.append("terminal")
+            return TerminalStatus("turn", "inProgress", 100, None, None, None)
+
+        def experimental_reader(_paths, _features):
+            order.append("experimental")
+            raise RuntimeError("mock query failed")
+
+        run_once(
+            self.store,
+            client_factory=lambda: _Client(),
+            status_reader=terminal_reader,
+            experimental_reader=experimental_reader,
+            now=105,
+        )
+        self.assertEqual(order, ["terminal", "experimental"])
+        with self.store.managed_connection() as connection:
+            state_count = connection.execute(
+                "SELECT COUNT(*) FROM experimental_signal_state"
+            ).fetchone()[0]
+        self.assertEqual(state_count, 0)
 
     def test_agent_completion_is_calibrated_to_failed_once(self):
         self.store.set_enabled(True, now=90)

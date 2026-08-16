@@ -108,6 +108,41 @@ def render_message(event_type: str, payload: dict[str, Any]) -> str:
             f"事件：{event_id}"
             f"{reason_block}"
         )
+    if event_type == "experimental_request_user_input":
+        return (
+            "❓ Codex 可能需要你回答一个问题\n"
+            f"项目：{project}\n"
+            "可信度：best_effort\n"
+            f"信号来源：{payload.get('signal_source') or 'hook'}\n"
+            f"时间：{_clock(occurred_at)}\n"
+            "建议回到 Codex 检查。\n"
+            f"Turn：{short_turn_id}\n"
+            f"信号：{payload.get('signal_id') or event_id}\n"
+            f"事件：{event_id}"
+        )
+    if event_type == "experimental_mcp_auth":
+        display_name = str(payload.get("display_name") or "某 MCP 服务")
+        return (
+            "🔐 Codex 全局状态提醒\n"
+            f"{display_name} 可能需要重新登录\n"
+            "可信度：best_effort\n"
+            f"信号来源：{payload.get('signal_source') or 'app_server_status'}\n"
+            f"时间：{_clock(occurred_at)}\n"
+            "建议回到 Codex 检查。\n"
+            f"信号：{payload.get('signal_id') or event_id}\n"
+            f"事件：{event_id}"
+        )
+    if event_type == "experimental_rate_limit":
+        return (
+            "⏳ Codex 全局状态提醒\n"
+            "账户可能达到限流\n"
+            "可信度：best_effort\n"
+            f"信号来源：{payload.get('signal_source') or 'app_server_status'}\n"
+            f"时间：{_clock(occurred_at)}\n"
+            "建议回到 Codex 检查。\n"
+            f"信号：{payload.get('signal_id') or event_id}\n"
+            f"事件：{event_id}"
+        )
     if event_type == "test":
         return f"🔔 Codex Notify 测试成功\n飞书通知链路工作正常。\n事件：{event_id}"
     raise ValueError(f"未知事件类型：{event_type}")
