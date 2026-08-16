@@ -12,7 +12,7 @@
 - Hook 只校验、对本地幂等身份做 SHA-256 指纹并写 SQLite；不启动 App Server、访问 Keychain、发送网络请求或返回审批决定。
 - worker 只在总开关和对应实验开关均开启时，按独立频率启动一次性 App Server 子进程。总超时 5 秒、stdout 上限 1 MiB，并与已有 metadata/terminal 查询共用非阻塞单实例锁。
 - MCP 查询固定使用 `detail="toolsAndAuthOnly"`；tools schema 只存在于受限进程响应中，解析结果不会保存它。resources 与 resourceTemplates 必须为空，否则失败关闭。
-- rate-limit parser 只保留服务端明确的 `rateLimitReachedType`、安全哈希状态键和窗口冷却哈希；不保存余额、套餐、组织、reset credit、Token 或账户标识。
+- rate-limit parser 校验 `usedPercent` 为有限数值，但只保留服务端明确的 `rateLimitReachedType`、安全哈希状态键和窗口冷却哈希；不保存百分比、余额、套餐、组织、reset credit、Token 或账户标识。
 - 原始 Hook payload、questions/options、MCP tools/resources、OAuth URL、App Server 原始响应、Prompt、preview、Turn Items、命令、路径和工具参数均不进入 SQLite、日志或消息。
 
 ## 能力矩阵

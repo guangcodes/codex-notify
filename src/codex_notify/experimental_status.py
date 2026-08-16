@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 import subprocess
 import tempfile
@@ -296,7 +297,8 @@ def _parse_window(value: object) -> int | None | object:
     duration = value.get("windowDurationMins")
     if (
         isinstance(used, bool)
-        or not isinstance(used, int)
+        or not isinstance(used, (int, float))
+        or (isinstance(used, float) and not math.isfinite(used))
         or reset is not None
         and (isinstance(reset, bool) or not isinstance(reset, int) or reset < 0)
         or duration is not None

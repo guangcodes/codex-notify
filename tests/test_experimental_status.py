@@ -219,6 +219,59 @@ class ExperimentalStatusReaderTests(unittest.TestCase):
         self.assertEqual(len(snapshot.rate_limits or ()), 1)
         self.assertEqual(snapshot.rate_limits[0].reached_type, "rate_limit_reached")
 
+    def test_rate_limit_window_accepts_finite_float_percentage(self):
+        process = _Process(
+            [
+                {"id": 1, "result": {}},
+                {
+                    "id": 2,
+                    "result": {
+                        "rateLimits": {
+                            "rateLimitReachedType": "rate_limit_reached",
+                            "primary": {
+                                "usedPercent": 42.5,
+                                "windowDurationMins": 60,
+                                "resetsAt": 1234,
+                            },
+                        },
+                        "rateLimitsByLimitId": None,
+                    },
+                },
+            ]
+        )
+
+        snapshot = ExperimentalStatusReader(
+            Path("/codex"), popen=lambda *args, **kwargs: process
+        ).read({"rate-limits"})
+
+        self.assertEqual(len(snapshot.rate_limits or ()), 1)
+        self.assertEqual(snapshot.rate_limits[0].reached_type, "rate_limit_reached")
+
+    def test_rate_limit_window_rejects_non_finite_percentage(self):
+        for used_percent in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(used_percent=used_percent):
+                process = _Process(
+                    [
+                        {"id": 1, "result": {}},
+                        {
+                            "id": 2,
+                            "result": {
+                                "rateLimits": {
+                                    "rateLimitReachedType": "rate_limit_reached",
+                                    "primary": {"usedPercent": used_percent},
+                                },
+                                "rateLimitsByLimitId": None,
+                            },
+                        },
+                    ]
+                )
+
+                snapshot = ExperimentalStatusReader(
+                    Path("/codex"), popen=lambda *args, **kwargs: process
+                ).read({"rate-limits"})
+
+                self.assertIsNone(snapshot.rate_limits)
+
     def test_repeated_cursor_and_oversized_collections_fail_closed(self):
         repeated = _Process(
             [

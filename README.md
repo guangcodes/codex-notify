@@ -21,7 +21,7 @@
 SessionStart ────────────────→ 只记录会话生命周期和上下文压缩来源
 UserPromptSubmit ────────────→ PENDING_ROOT_CANDIDATE（统一等待 5 秒）
 PermissionRequest ───────────→ 仅精确归属已确认根 Turn 后登记审批通知
-PreToolUse(request_user_input)→ 仅精确归属已确认根 Turn 后登记尽力问题提醒
+PreToolUse(request_user_input) → 仅精确归属已确认根 Turn 后登记尽力问题提醒
 SubagentStart/SubagentStop ──→ 保存原始 Hook 身份并推导唯一活动父 Turn
 agent-turn-complete ─────────→ 权威正常完成信号，触发有界终态校准
                                   ↓
@@ -46,7 +46,7 @@ account/rateLimits/read ─────→ 账户限流全局状态（实验，�
 
 ## Turn 策略
 
-状态分为三个互不替代的维度：
+状态分为四个互不替代的维度：
 
 - `classification`：`PENDING_ROOT_CANDIDATE`、`NOTIFIABLE_ROOT`、`CONFIRMED_CHILD`、`UNVERIFIED`、`CONFLICT`
 - `lifecycle`：`RUNNING`、`COMPLETED`
@@ -89,15 +89,16 @@ codex-notify experimental disable rate-limits
 `unavailable`，不能启用。单独 disable 某项实验功能会永久抑制该功能尚未发送的事件，
 不会影响另外两项实验功能或总开关。
 
-启动和完成事件分别使用等价于以下元组的唯一键：
+Turn 级事件使用等价于以下元组的唯一键：
 
 ```text
 (session_id, turn_id, "started")
 (session_id, turn_id, "completed")
 (session_id, turn_id, "permission:<hook-payload-fingerprint>")
+(session_id, turn_id, "request-user-input:<hook-payload-fingerprint>")
 ```
 
-SQLite 发件队列保证本地幂等、启动/完成顺序和失败重试。未发送项超过 24 小时后会标记为永久失败；消息在落库前会脱敏和截断。
+全局 MCP 与账户限流事件则使用安全哈希信号键、状态转换或窗口冷却身份，不伪造 Turn ID。SQLite 发件队列保证本地幂等、启动/完成顺序和失败重试。未发送项超过 24 小时后会标记为永久失败；消息在落库前会脱敏和截断。
 
 ## 依赖与兼容性
 
@@ -185,7 +186,7 @@ codex-notify status
 - `doctor` 应确认凭据、六个 Hook 的命令、matcher 与元数据、bundled App Server 终态 schema、三个实验 capability、Computer Use 通知链、runtime 版本和 LaunchAgent；Hook 是否已被用户信任仍以 Codex `/hooks` 为准。
 - `test` 应向飞书发送一条显式测试消息。
 - `on` 允许后续符合策略的 Turn 生成通知；项目默认关闭，不会因安装自动开启。
-- `status` 显示当前开关、等待终态校准数、三类终态统计、审批通知统计、最近一次 App Server 查询结果、队列和投递概况；不会打印原始错误、命令或路径。
+- `status` 显示当前开关、实验 capability 与子开关、等待终态校准数、三类终态统计、审批与 best-effort 通知统计、最近一次实验状态成功查询时间和终态 App Server 查询结果、队列和投递概况；不会打印原始错误、命令或路径。
 
 如果验证失败，不要反复覆盖配置；先根据 `doctor` 的具体失败项检查 Computer Use、Hook 信任、Keychain 或 LaunchAgent。
 
