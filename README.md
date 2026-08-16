@@ -13,6 +13,7 @@
 - [安全策略](https://github.com/guangcodes/codex-notify/blob/main/SECURITY.md)：支持版本、私密漏洞报告入口和信任边界。
 - [参与贡献](https://github.com/guangcodes/codex-notify/blob/main/CONTRIBUTING.md)：支持契约、验证要求和发布文档同步规则。
 - [第三方与商标声明](https://github.com/guangcodes/codex-notify/blob/main/THIRD_PARTY_NOTICES.md)：发行包、外部依赖、服务和商标边界。
+- [实验通知覆盖](https://github.com/guangcodes/codex-notify/blob/main/docs/experimental-notification-coverage.md)：尽力通知、只读状态查询和真实环境验收的证据边界。
 - [v0.1.0 发布验收记录](https://github.com/guangcodes/codex-notify/blob/main/docs/release-acceptance-v0.1.0.md)：首个公开版本的历史实机与产物证据；不代表后续版本的当前行为。
 
 ## 事件链
