@@ -28,7 +28,7 @@ from .computer_use import (
     decode_previous_notify,
     inspect_computer_use,
 )
-from .constants import HOOK_STATUS_START
+from .constants import HOOK_STATUS_PERMISSION, HOOK_STATUS_START
 from .paths import AppPaths
 
 
@@ -54,6 +54,7 @@ CURRENT_HOOK_EVENTS = (
     "UserPromptSubmit",
     "SubagentStart",
     "SubagentStop",
+    "PermissionRequest",
 )
 LEGACY_HOOK_EVENTS = ("PreToolUse", "Stop")
 OWNED_HOOK_EVENTS = CURRENT_HOOK_EVENTS + LEGACY_HOOK_EVENTS
@@ -1221,7 +1222,11 @@ raise SystemExit(main())
             }
             if event_name == "UserPromptSubmit":
                 handler["statusMessage"] = HOOK_STATUS_START
+            elif event_name == "PermissionRequest":
+                handler["statusMessage"] = HOOK_STATUS_PERMISSION
             group: dict[str, Any] = {"hooks": [handler]}
+            if event_name == "PermissionRequest":
+                group["matcher"] = ".*"
             groups.append(group)
             hooks[event_name] = groups
 
@@ -2041,6 +2046,13 @@ raise SystemExit(main())
                             raise ValueError(
                                 "现有 hooks.json 的 PreToolUse codex-notify Hook 已漂移"
                             )
+                        if (
+                            event_name == "PermissionRequest"
+                            and group.get("matcher") != ".*"
+                        ):
+                            raise ValueError(
+                                "现有 hooks.json 的 PermissionRequest codex-notify Hook 已漂移"
+                            )
                         validated_managed_hooks.setdefault(event_name, []).append(
                             dict(handler)
                         )
@@ -2823,6 +2835,8 @@ def is_expected_managed_hook(
     }
     if event_name == "UserPromptSubmit":
         expected["statusMessage"] = HOOK_STATUS_START
+    elif event_name == "PermissionRequest":
+        expected["statusMessage"] = HOOK_STATUS_PERMISSION
     return item == expected
 
 

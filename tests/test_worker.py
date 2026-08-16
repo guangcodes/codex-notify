@@ -5,7 +5,8 @@ import unittest
 from pathlib import Path
 
 from codex_notify.app_server_metadata import ThreadMetadata
-from codex_notify.db import HookEvent, NotificationStore
+from codex_notify.app_server_status import TerminalStatus
+from codex_notify.db import HookEvent, NotificationStore, PermissionEvent
 from codex_notify.feishu import DeliveryError
 from codex_notify.paths import AppPaths
 from codex_notify.worker import run_once
@@ -152,10 +153,15 @@ class WorkerTests(unittest.TestCase):
             HookEvent("session-1", "turn-1", "/work/example", prompt="work"),
             now=100,
         )
+        self.store.record_permission_request(
+            PermissionEvent("session-1", "turn-1", "Shell", "a" * 64), now=101
+        )
+        client = _Client()
 
         self.assertEqual(
             run_once(
                 self.store,
+                client_factory=lambda: client,
                 metadata_reader=lambda _paths, _ids, _turn_ids: None,
                 now=105,
             ),
@@ -166,7 +172,12 @@ class WorkerTests(unittest.TestCase):
             classification = connection.execute(
                 "SELECT classification FROM turns"
             ).fetchone()[0]
+            permission_status = connection.execute(
+                "SELECT status FROM outbox WHERE event_type='permission'"
+            ).fetchone()[0]
         self.assertEqual(classification, "PENDING_ROOT_CANDIDATE")
+        self.assertEqual(permission_status, "pending")
+        self.assertEqual(client.messages, [])
 
     def test_worker_defers_metadata_candidates_beyond_single_probe(self):
         self.store.set_enabled(True, now=90)
@@ -366,6 +377,162 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(self.store.event_status(key), "sent")
         self.assertFalse(self.store.is_enabled())
         self.assertTrue(self.store.is_delivery_paused())
+
+    def test_agent_completion_is_calibrated_to_failed_once(self):
+        self.store.set_enabled(True, now=90)
+        self.store.record_start(
+            HookEvent("session", "turn", "/work/example", prompt="work"), now=100
+        )
+        client = _Client()
+        run_once(
+            self.store,
+            client_factory=lambda: client,
+            metadata_reader=lambda _paths, _ids, _turn_ids: {
+                "session": ThreadMetadata("app-thread", None, "appServer", 90)
+            },
+            status_reader=lambda _paths, _thread, _turn: TerminalStatus(
+                "turn", "inProgress", 100, None, None, None
+            ),
+            now=105,
+        )
+        self.store.record_completion(
+            HookEvent("session", "turn", "", last_assistant_message="private result"),
+            now=106,
+        )
+        failed = TerminalStatus(
+            "turn", "failed", 100, 107, 7000, "serverOverloaded"
+        )
+        run_once(
+            self.store,
+            client_factory=lambda: client,
+            status_reader=lambda _paths, _thread, _turn: failed,
+            now=107,
+        )
+        self.assertEqual(
+            run_once(self.store, client_factory=lambda: client, now=112), 1
+        )
+        self.assertEqual(len(client.messages), 2)
+        self.assertIn("状态：failed", client.messages[-1])
+        self.assertIn("错误类别：serverOverloaded", client.messages[-1])
+        with self.store.managed_connection() as connection:
+            rows = connection.execute(
+                "SELECT event_type FROM outbox WHERE event_type='completed'"
+            ).fetchall()
+            turn = connection.execute("SELECT * FROM turns").fetchone()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(turn["terminal_status"], "failed")
+
+    def test_compensation_scan_finds_interrupted_without_completion_signal(self):
+        self.store.set_enabled(True, now=90)
+        self.store.record_start(
+            HookEvent("session", "turn", "/work/example", prompt="work"), now=100
+        )
+        order = []
+
+        class OrderedClient(_Client):
+            def send_text(self, message):
+                order.append("send")
+                super().send_text(message)
+
+        client = OrderedClient()
+
+        def status_reader(_paths, thread_id, turn_id):
+            order.append("scan")
+            self.assertEqual((thread_id, turn_id), ("app-thread", "turn"))
+            return TerminalStatus("turn", "interrupted", 100, 104, 4000, None)
+
+        self.assertEqual(
+            run_once(
+                self.store,
+                client_factory=lambda: client,
+                metadata_reader=lambda _paths, _ids, _turn_ids: {
+                    "session": ThreadMetadata("app-thread", None, "appServer", 90)
+                },
+                status_reader=status_reader,
+                now=105,
+            ),
+            1,
+        )
+        self.assertEqual(order, ["send", "scan"])
+        self.assertEqual(
+            run_once(self.store, client_factory=lambda: client, now=109), 0
+        )
+        self.assertEqual(
+            run_once(self.store, client_factory=lambda: client, now=110), 1
+        )
+        self.assertIn("状态：interrupted", client.messages[-1])
+
+    def test_agent_completion_falls_back_after_bounded_calibration(self):
+        self.store.set_enabled(True, now=90)
+        self.store.record_start(
+            HookEvent("session", "turn", "/work/example", prompt="work"), now=100
+        )
+        client = _Client()
+        run_once(
+            self.store,
+            client_factory=lambda: client,
+            metadata_reader=lambda _paths, _ids, _turn_ids: {
+                "session": ThreadMetadata("app-thread", None, "appServer", 90)
+            },
+            status_reader=lambda _paths, _thread, _turn: TerminalStatus(
+                "turn", "inProgress", 100, None, None, None
+            ),
+            now=105,
+        )
+        self.store.record_completion(
+            HookEvent("session", "turn", "", last_assistant_message="done"), now=106
+        )
+        run_once(
+            self.store,
+            client_factory=lambda: client,
+            status_reader=lambda _paths, _thread, _turn: None,
+            now=106,
+        )
+        self.assertEqual(run_once(self.store, client_factory=lambda: client, now=111), 1)
+        self.assertIn("状态：completed", client.messages[-1])
+        with self.store.managed_connection() as connection:
+            source = connection.execute(
+                "SELECT terminal_source FROM turns"
+            ).fetchone()[0]
+        self.assertEqual(source, "agent_turn_complete_fallback")
+
+    def test_due_probe_runs_before_completion_fallback(self):
+        self.store.set_enabled(True, now=90)
+        self.store.record_start(
+            HookEvent("session", "turn", "/work/example", prompt="work"), now=100
+        )
+        client = _Client()
+        run_once(
+            self.store,
+            client_factory=lambda: client,
+            metadata_reader=lambda _paths, _ids, _turn_ids: {
+                "session": ThreadMetadata("app-thread", None, "appServer", 90)
+            },
+            status_reader=lambda _paths, _thread, _turn: TerminalStatus(
+                "turn", "inProgress", 100, None, None, None
+            ),
+            now=105,
+        )
+        self.store.record_completion(
+            HookEvent("session", "turn", "", last_assistant_message="done"), now=106
+        )
+        failed = TerminalStatus("turn", "failed", 100, 107, 7000, "other")
+
+        self.assertEqual(
+            run_once(
+                self.store,
+                client_factory=lambda: client,
+                status_reader=lambda _paths, _thread, _turn: failed,
+                now=112,
+            ),
+            0,
+        )
+        with self.store.managed_connection() as connection:
+            turn = connection.execute("SELECT * FROM turns").fetchone()
+        self.assertEqual(turn["terminal_status"], "failed")
+        self.assertEqual(turn["terminal_source"], "app_server")
+        self.assertEqual(run_once(self.store, client_factory=lambda: client, now=117), 1)
+        self.assertIn("状态：failed", client.messages[-1])
 
 
 if __name__ == "__main__":

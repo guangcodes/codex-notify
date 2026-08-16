@@ -237,6 +237,7 @@ class InstallerTests(unittest.TestCase):
             "UserPromptSubmit",
             "SubagentStart",
             "SubagentStop",
+            "PermissionRequest",
         ):
             commands = [
                 handler["command"]
@@ -247,6 +248,12 @@ class InstallerTests(unittest.TestCase):
                 sum(command.endswith(f"hook {event_name}") for command in commands),
                 1,
             )
+        permission_group = document["hooks"]["PermissionRequest"][-1]
+        self.assertEqual(permission_group["matcher"], ".*")
+        self.assertEqual(
+            permission_group["hooks"][0]["statusMessage"],
+            "Queueing confirmed Codex permission notification",
+        )
         self.assertNotIn("PreToolUse", document["hooks"])
         self.assertTrue(self.installer.paths.runner.exists())
         self.assertTrue(self.installer.launch_agent.exists())
@@ -840,6 +847,7 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn("PreToolUse", document["hooks"])
         self.assertNotIn("SubagentStart", document["hooks"])
         self.assertNotIn("SubagentStop", document["hooks"])
+        self.assertNotIn("PermissionRequest", document["hooks"])
         self.assertEqual(
             installer_module.tomllib.loads(
                 self.installer.config_file.read_text(encoding="utf-8")
@@ -880,6 +888,17 @@ class InstallerTests(unittest.TestCase):
             self.installer.hooks_file.read_text(encoding="utf-8"),
             original,
         )
+
+    def test_permission_matcher_drift_fails_closed(self):
+        self.installer.install(start_agent=False)
+        document = json.loads(self.installer.hooks_file.read_text(encoding="utf-8"))
+        document["hooks"]["PermissionRequest"][-1]["matcher"] = "Shell"
+        drifted = json.dumps(document)
+        self.installer.hooks_file.write_text(drifted, encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "PermissionRequest.*漂移"):
+            self.installer.install(start_agent=False)
+        with self.assertRaisesRegex(ValueError, "PermissionRequest.*漂移"):
+            self.installer.uninstall()
 
     def test_install_and_uninstall_fail_closed_on_managed_hook_drift(self):
         self.installer.install(start_agent=False)

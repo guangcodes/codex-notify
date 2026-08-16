@@ -7,7 +7,8 @@ from contextlib import closing
 from pathlib import Path
 
 from codex_notify.constants import OUTBOX_RETENTION_SECONDS
-from codex_notify.db import HookEvent, NotificationStore
+from codex_notify.app_server_status import TerminalStatus
+from codex_notify.db import HookEvent, NotificationStore, PermissionEvent, SubagentEvent
 from codex_notify.paths import AppPaths
 
 
@@ -223,6 +224,323 @@ class NotificationStoreTests(unittest.TestCase):
         self.assertEqual(self.store.claim_due(limit=1, now=110), [])
         recovered = self.store.claim_due(limit=1, now=200)
         self.assertEqual(recovered[0]["attempts"], 2)
+
+    def test_child_permission_is_attributed_to_exact_confirmed_root(self):
+        self.store.set_enabled(True, now=1)
+        self._start(now=10)
+        self.store.record_subagent_start(
+            SubagentEvent("child-session", "review", "session-1", "child-turn"),
+            now=16,
+        )
+        self.store.record_start(
+            HookEvent("child-session", "child-turn", "/work/example", prompt="child"),
+            now=17,
+        )
+        created = self.store.record_permission_request(
+            PermissionEvent(
+                "child-session",
+                "child-turn",
+                "mcp__server__tool",
+                "a" * 64,
+            ),
+            now=18,
+        )
+        self.assertTrue(created)
+        with self.store.managed_connection() as connection:
+            row = connection.execute(
+                "SELECT session_id, turn_id, payload_json FROM outbox "
+                "WHERE event_type='permission'"
+            ).fetchone()
+        self.assertEqual((row["session_id"], row["turn_id"]), ("session-1", "turn-1"))
+        self.assertIn("子任务审批：MCP 工具审批", row["payload_json"])
+
+    def test_permission_during_root_confirmation_waits_for_started_delivery(self):
+        self.store.set_enabled(True, now=1)
+        self.store.record_start(self.event, now=100)
+        self.assertTrue(
+            self.store.record_permission_request(
+                PermissionEvent("session-1", "turn-1", "Shell", "e" * 64),
+                now=101,
+            )
+        )
+        self.assertEqual(self.store.claim_due(limit=10, now=101), [])
+
+        self.store.record_thread_metadata(
+            "session-1",
+            turn_id="turn-1",
+            app_thread_id="app-thread",
+            parent_thread_id=None,
+            source_kind="appServer",
+            now=105,
+        )
+        self.store.finalize_pending(now=105)
+        started = self.store.claim_due(limit=10, now=105)
+        self.assertEqual([item["event_type"] for item in started], ["started"])
+        self.store.mark_sent(started[0]["id"], now=105)
+        permission = self.store.claim_due(limit=10, now=105)
+        self.assertEqual([item["event_type"] for item in permission], ["permission"])
+
+    def test_permission_during_unverified_root_confirmation_is_suppressed(self):
+        self.store.set_enabled(True, now=1)
+        self.store.record_start(self.event, now=100)
+        self.assertTrue(
+            self.store.record_permission_request(
+                PermissionEvent("session-1", "turn-1", "Shell", "f" * 64),
+                now=101,
+            )
+        )
+
+        self.store.finalize_pending(now=105)
+        with self.store.managed_connection() as connection:
+            permission = connection.execute(
+                "SELECT status FROM outbox WHERE event_type='permission'"
+            ).fetchone()
+        self.assertEqual(permission["status"], "suppressed")
+
+    def test_permission_stays_silent_after_off_now_and_reenable(self):
+        self.store.set_enabled(True, now=1)
+        self._start(now=10)
+        event = PermissionEvent("session-1", "turn-1", "Shell", "b" * 64)
+        self.store.set_enabled(False, immediate=True, now=20)
+        self.store.set_enabled(True, now=21)
+        self.assertFalse(self.store.record_permission_request(event, now=22))
+        with self.store.managed_connection() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM outbox WHERE event_type='permission'"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_graceful_off_keeps_registered_permission_and_terminal_eligible(self):
+        self.store.set_enabled(True, now=1)
+        self._start(now=10)
+        self.store.set_enabled(False, now=16)
+        self.assertTrue(
+            self.store.record_permission_request(
+                PermissionEvent("session-1", "turn-1", "Shell", "c" * 64),
+                now=17,
+            )
+        )
+        with self.store.managed_connection() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM outbox WHERE event_type='permission'"
+                ).fetchone()[0],
+                1,
+            )
+
+    def test_permission_is_silent_after_turn_terminalization(self):
+        self.store.set_enabled(True, now=1)
+        self.store.record_start(self.event, now=100)
+        self.store.record_thread_metadata(
+            "session-1",
+            turn_id="turn-1",
+            app_thread_id="app-thread",
+            parent_thread_id=None,
+            source_kind="appServer",
+            now=105,
+        )
+        self.store.finalize_pending(now=105)
+        self.store.record_terminal_probe(
+            "session-1",
+            "turn-1",
+            TerminalStatus("turn-1", "interrupted", 100, 106, 6000, None),
+            now=106,
+        )
+
+        self.assertFalse(
+            self.store.record_permission_request(
+                PermissionEvent("session-1", "turn-1", "Shell", "d" * 64),
+                now=107,
+            )
+        )
+        with self.store.managed_connection() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM outbox WHERE event_type='permission'"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_terminal_race_keeps_first_status_and_one_terminal_event(self):
+        self.store.set_enabled(True, now=1)
+        self.store.record_start(self.event, now=100)
+        self.store.record_thread_metadata(
+            "session-1",
+            turn_id="turn-1",
+            app_thread_id="app-thread",
+            parent_thread_id=None,
+            source_kind="appServer",
+            now=105,
+        )
+        self.store.finalize_pending(now=105)
+        self.store.record_completion(
+            HookEvent("session-1", "turn-1", "", last_assistant_message="done"),
+            now=106,
+        )
+        self.assertTrue(
+            self.store.record_terminal_probe(
+                "session-1",
+                "turn-1",
+                TerminalStatus("turn-1", "failed", 100, 107, 7000, "other"),
+                now=107,
+            )
+        )
+        self.assertFalse(
+            self.store.record_terminal_probe(
+                "session-1",
+                "turn-1",
+                TerminalStatus("turn-1", "interrupted", 100, 108, 8000, None),
+                now=108,
+            )
+        )
+        self.store.finalize_aggregations(now=112)
+        self.store.finalize_aggregations(now=113)
+        with self.store.managed_connection() as connection:
+            turn = connection.execute("SELECT * FROM turns").fetchone()
+            terminals = connection.execute(
+                "SELECT COUNT(*) FROM outbox WHERE event_type='completed'"
+            ).fetchone()[0]
+            conflicts = connection.execute(
+                "SELECT value FROM settings WHERE key='terminal_status_conflicts'"
+            ).fetchone()[0]
+        self.assertEqual(turn["terminal_status"], "failed")
+        self.assertEqual(terminals, 1)
+        self.assertEqual(conflicts, "1")
+
+    def test_completion_hook_enriches_terminal_probe_before_outbox_finalization(self):
+        self.store.set_enabled(True, now=1)
+        self.store.record_start(self.event, now=100)
+        self.store.record_thread_metadata(
+            "session-1",
+            turn_id="turn-1",
+            app_thread_id="app-thread",
+            parent_thread_id=None,
+            source_kind="appServer",
+            now=105,
+        )
+        self.store.finalize_pending(now=105)
+        self.assertTrue(
+            self.store.record_terminal_probe(
+                "session-1",
+                "turn-1",
+                TerminalStatus("turn-1", "completed", 100, 106, 6000, None),
+                now=106,
+            )
+        )
+        self.assertFalse(
+            self.store.record_completion(
+                HookEvent(
+                    "session-1",
+                    "turn-1",
+                    "",
+                    last_assistant_message="authoritative final summary",
+                ),
+                now=107,
+            )
+        )
+
+        self.store.finalize_aggregations(now=111)
+        with self.store.managed_connection() as connection:
+            payload = json.loads(
+                connection.execute(
+                    "SELECT payload_json FROM outbox WHERE event_type='completed'"
+                ).fetchone()[0]
+            )
+        self.assertEqual(payload["summary"], "authoritative final summary")
+
+    def test_completion_fallback_clears_calibration_deadline(self):
+        self.store.set_enabled(True, now=1)
+        self._start(now=100)
+        self.store.record_completion(
+            HookEvent("session-1", "turn-1", "", last_assistant_message="done"),
+            now=106,
+        )
+
+        self.store.finalize_aggregations(now=111)
+        with self.store.managed_connection() as connection:
+            turn = connection.execute("SELECT * FROM turns").fetchone()
+        self.assertEqual(turn["terminal_status"], "completed")
+        self.assertIsNone(turn["terminal_check_due_at"])
+        self.assertIsNone(turn["terminal_calibration_deadline"])
+
+    def test_completion_fallback_does_not_require_unavailable_migrated_thread_id(self):
+        self.store.set_enabled(True, now=1)
+        self._start(now=100)
+        with self.store.managed_connection() as connection:
+            connection.execute("UPDATE turns SET app_thread_id=NULL")
+        self.store.record_completion(
+            HookEvent("session-1", "turn-1", "", last_assistant_message="done"),
+            now=106,
+        )
+
+        self.store.finalize_aggregations(now=111, require_due_probe=True)
+        with self.store.managed_connection() as connection:
+            turn = connection.execute("SELECT * FROM turns").fetchone()
+        self.assertEqual(turn["terminal_status"], "completed")
+        self.assertEqual(turn["terminal_source"], "agent_turn_complete_fallback")
+
+    def test_terminal_observation_starts_fresh_summary_aggregation_window(self):
+        self.store.set_enabled(True, now=1)
+        self.store.record_start(self.event, now=90)
+        self.store.record_thread_metadata(
+            "session-1",
+            turn_id="turn-1",
+            app_thread_id="app-thread",
+            parent_thread_id=None,
+            source_kind="appServer",
+            now=95,
+        )
+        self.store.finalize_pending(now=95)
+        self.store.record_terminal_probe(
+            "session-1",
+            "turn-1",
+            TerminalStatus("turn-1", "completed", 90, 100, 10000, None),
+            now=110,
+        )
+        self.store.record_completion(
+            HookEvent(
+                "session-1",
+                "turn-1",
+                "",
+                last_assistant_message="authoritative summary",
+            ),
+            now=111,
+        )
+
+        self.assertEqual(self.store.finalize_aggregations(now=114), 0)
+        self.assertEqual(self.store.finalize_aggregations(now=115), 1)
+        with self.store.managed_connection() as connection:
+            payload = json.loads(
+                connection.execute(
+                    "SELECT payload_json FROM outbox WHERE event_type='completed'"
+                ).fetchone()[0]
+            )
+        self.assertEqual(payload["occurred_at"], 100.0)
+        self.assertEqual(payload["summary"], "authoritative summary")
+
+    def test_terminal_scan_expires_after_retention(self):
+        self.store.set_enabled(True, now=1)
+        self.store.record_start(self.event, now=100)
+        self.store.record_thread_metadata(
+            "session-1",
+            turn_id="turn-1",
+            app_thread_id="app-thread",
+            parent_thread_id=None,
+            source_kind="appServer",
+            now=105,
+        )
+        self.store.finalize_pending(now=105)
+        self.assertEqual(
+            self.store.pending_terminal_turns(now=100 + OUTBOX_RETENTION_SECONDS),
+            [],
+        )
+        with self.store.managed_connection() as connection:
+            stopped = connection.execute(
+                "SELECT terminal_scan_stopped_at FROM turns"
+            ).fetchone()[0]
+        self.assertIsNotNone(stopped)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ import plistlib
 import shlex
 import subprocess
 import sys
+import tempfile
 import tomllib
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,7 @@ from pathlib import Path
 from . import __version__
 from .app_server_metadata import find_bundled_codex
 from .computer_use import inspect_computer_use
+from .constants import HOOK_STATUS_PERMISSION, HOOK_STATUS_START
 from .db import NotificationStore
 from .feishu import validate_webhook_url
 from .hooks import hook_main
@@ -70,6 +72,7 @@ def _parser() -> argparse.ArgumentParser:
             "UserPromptSubmit",
             "SubagentStart",
             "SubagentStop",
+            "PermissionRequest",
             "PreToolUse",
             "Stop",
         ),
@@ -108,6 +111,65 @@ def _installed_runtime_version(package_dir: Path) -> str | None:
     return None
 
 
+def _app_server_terminal_capability(binary: Path | None) -> bool:
+    if binary is None:
+        return False
+    try:
+        with tempfile.TemporaryDirectory(prefix="codex-notify-schema-") as directory:
+            result = subprocess.run(
+                [
+                    str(binary),
+                    "app-server",
+                    "generate-json-schema",
+                    "--experimental",
+                    "--out",
+                    directory,
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            if result.returncode != 0:
+                return False
+            root = Path(directory) / "v2"
+            params = json.loads(
+                (root / "ThreadTurnsListParams.json").read_text(encoding="utf-8")
+            )
+            response = json.loads(
+                (root / "ThreadTurnsListResponse.json").read_text(encoding="utf-8")
+            )
+            item_views = params["definitions"]["TurnItemsView"]["oneOf"]
+            statuses = response["definitions"]["TurnStatus"]["enum"]
+            turn = response["definitions"]["Turn"]
+            if (
+                not isinstance(item_views, list)
+                or not all(isinstance(item, dict) for item in item_views)
+                or not isinstance(statuses, list)
+                or not all(isinstance(status, str) for status in statuses)
+                or not isinstance(turn, dict)
+                or not isinstance(turn.get("properties"), dict)
+            ):
+                return False
+            return (
+                any(item.get("enum") == ["notLoaded"] for item in item_views)
+                and set(statuses)
+                == {"completed", "failed", "interrupted", "inProgress"}
+                and {"id", "status", "items", "itemsView"}.issubset(
+                    turn["properties"]
+                )
+            )
+    except (
+        OSError,
+        subprocess.SubprocessError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        UnicodeError,
+    ):
+        return False
+
+
 def _status(store: NotificationStore) -> None:
     snapshot = store.status_snapshot()
     print(f"通知：{'开启' if snapshot['enabled'] else '关闭'}")
@@ -116,9 +178,29 @@ def _status(store: NotificationStore) -> None:
     print(f"待分类确认：{snapshot['pending_decisions']}")
     print(f"无法确认且已静默：{snapshot.get('unverified_turns', 0)}")
     print(f"关系冲突：{snapshot.get('conflict_relations', 0)}")
+    print(f"等待终态校准：{snapshot.get('waiting_terminal', 0)}")
+    print(
+        "终态统计："
+        f"completed={snapshot.get('completed_turns', 0)}，"
+        f"failed={snapshot.get('failed_turns', 0)}，"
+        f"interrupted={snapshot.get('interrupted_turns', 0)}"
+    )
+    print(
+        "审批通知："
+        f"总计={snapshot.get('permission_total', 0)}，"
+        f"已发送={snapshot.get('permission_sent', 0)}"
+    )
+    terminal_query = snapshot.get("last_terminal_query_ok")
+    terminal_query_label = (
+        "成功" if terminal_query == "1" else "失败" if terminal_query == "0" else "无"
+    )
+    print(
+        f"最近 App Server 终态查询：{terminal_query_label}"
+        f"（{_format_timestamp(snapshot.get('last_terminal_query_at'))}）"
+    )
     print(f"永久失败：{snapshot['dead']}")
     print(f"最近成功：{_format_timestamp(snapshot['last_delivery_at'])}")
-    print(f"最近错误：{snapshot['last_error'] or '无'}")
+    print(f"最近错误：{'有（详情已隐藏）' if snapshot['last_error'] else '无'}")
 
 
 def _configure() -> None:
@@ -174,14 +256,16 @@ def _doctor(paths: AppPaths) -> int:
     checks: list[tuple[str, bool, str]] = []
     checks.append(("macOS", platform.system() == "Darwin", platform.system()))
     bundled_codex = find_bundled_codex()
+    terminal_capability = _app_server_terminal_capability(bundled_codex)
     checks.append(
         (
-            "App Server 元数据优化",
-            True,
+            "App Server 终态读取",
+            terminal_capability,
             (
-                f"可用：{bundled_codex}"
-                if bundled_codex is not None
-                else "已降级：未找到 ChatGPT Desktop bundled Codex；通知主链不受影响"
+                "bundled Codex 可用；运行时强制 thread/turns/list "
+                "itemsView=notLoaded 且 items=[]"
+                if terminal_capability
+                else "bundled Codex 缺失或 thread/turns/list 终态 schema 不兼容"
             ),
         )
     )
@@ -216,7 +300,13 @@ def _doctor(paths: AppPaths) -> int:
     hooks_ok = False
     hook_events_ok: dict[str, bool] = {
         event_name: False
-        for event_name in ("SessionStart", "UserPromptSubmit", "SubagentStart", "SubagentStop")
+        for event_name in (
+            "SessionStart",
+            "UserPromptSubmit",
+            "SubagentStart",
+            "SubagentStop",
+            "PermissionRequest",
+        )
     }
     if paths.hooks_file.exists():
         try:
@@ -227,7 +317,11 @@ def _doctor(paths: AppPaths) -> int:
                 if not isinstance(groups, list):
                     continue
                 hook_events_ok[event_name] = any(
-                    _hook_handler_ok(handler, paths.runner, event_name)
+                    (
+                        event_name != "PermissionRequest"
+                        or group.get("matcher") == ".*"
+                    )
+                    and _hook_handler_ok(handler, paths.runner, event_name)
                     for group in groups
                     if isinstance(group, dict)
                     for handler in (group.get("hooks") or [])
@@ -245,7 +339,7 @@ def _doctor(paths: AppPaths) -> int:
                 if not hooks_enabled
                 else (
                     f"{paths.hooks_file}（SessionStart/UserPromptSubmit/SubagentStart/"
-                    "SubagentStop 均需在 /hooks 确认信任）"
+                    "SubagentStop/PermissionRequest 均需在 /hooks 确认信任）"
                 )
             ),
         )
