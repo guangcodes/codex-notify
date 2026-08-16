@@ -566,7 +566,7 @@ class AppServerMetadataTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             paths = AppPaths(Path(directory))
             paths.ensure_runtime_dirs()
-            lock_path = paths.data_dir / "metadata-probe.lock"
+            lock_path = paths.data_dir / "app-server-probe.lock"
             descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)

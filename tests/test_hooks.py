@@ -118,6 +118,77 @@ class HookTests(unittest.TestCase):
         )
         self.assertTrue(self.store.paths.error_log.exists())
 
+    def test_permission_request_is_confirmed_idempotent_and_does_not_store_raw_payload(self):
+        self.store.record_start(
+            self.store_event("session", "turn", "/projects/demo"), now=10
+        )
+        self.store.record_thread_metadata(
+            "session",
+            turn_id="turn",
+            app_thread_id="thread-app",
+            parent_thread_id=None,
+            source_kind="appServer",
+            now=15,
+        )
+        self.store.finalize_pending(now=15)
+        payload = {
+            "hook_event_name": "PermissionRequest",
+            "session_id": "session",
+            "turn_id": "turn",
+            "cwd": "/private/secret/project",
+            "model": "model",
+            "permission_mode": "default",
+            "transcript_path": "/private/transcript.jsonl",
+            "tool_name": "Shell",
+            "tool_input": {
+                "command": "curl https://example.invalid -H 'Authorization: Bearer secret'",
+                "reason": "/private/project/full/path.txt",
+            },
+        }
+
+        process_hook("PermissionRequest", payload, self.store)
+        process_hook("PermissionRequest", payload, self.store)
+
+        with self.store.managed_connection() as connection:
+            rows = connection.execute(
+                "SELECT event_type, payload_json FROM outbox ORDER BY id"
+            ).fetchall()
+        self.assertEqual([row["event_type"] for row in rows], ["started", "permission"])
+        stored = rows[-1]["payload_json"]
+        self.assertIn("命令执行审批", stored)
+        self.assertNotIn("curl", stored)
+        self.assertNotIn("/private/project/full/path.txt", stored)
+        database_bytes = self.store.paths.database.read_bytes()
+        self.assertNotIn(b"Authorization: Bearer secret", database_bytes)
+        self.assertNotIn(b"/private/transcript.jsonl", database_bytes)
+
+    def test_permission_request_without_confirmed_turn_is_silent_and_returns_no_decision(self):
+        output = io.StringIO()
+        result = hook_main(
+            "PermissionRequest",
+            io.StringIO(
+                json.dumps(
+                    {
+                        "session_id": "unknown",
+                        "turn_id": "unknown",
+                        "tool_name": "mcp__server__tool",
+                        "tool_input": {},
+                    }
+                )
+            ),
+            output,
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue(), "")
+        with self.store.managed_connection() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+
+    @staticmethod
+    def store_event(session_id, turn_id, cwd):
+        from codex_notify.db import HookEvent
+
+        return HookEvent(session_id, turn_id, cwd, prompt="work")
+
 
 if __name__ == "__main__":
     unittest.main()

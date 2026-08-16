@@ -372,7 +372,7 @@ def read_pending_metadata(
     if binary is None or not thread_ids:
         return {}
     paths.ensure_runtime_dirs()
-    lock_path = paths.data_dir / "metadata-probe.lock"
+    lock_path = paths.data_dir / "app-server-probe.lock"
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(lock_path, flags, 0o600)

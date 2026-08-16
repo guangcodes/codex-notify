@@ -10,9 +10,16 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from codex_notify import __version__
-from codex_notify.cli import _configure, _doctor, _hook_handler_ok, _status, main
+from codex_notify.cli import (
+    _app_server_terminal_capability,
+    _configure,
+    _doctor,
+    _hook_handler_ok,
+    _status,
+    main,
+)
 from codex_notify.computer_use import ComputerUseIntegration, encode_previous_notify
-from codex_notify.constants import HOOK_STATUS_START
+from codex_notify.constants import HOOK_STATUS_PERMISSION, HOOK_STATUS_START
 from codex_notify.installer import LEGACY_LAUNCH_AGENT_LABEL
 from codex_notify.keychain import FeishuCredentials
 
@@ -64,6 +71,119 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("review", report)
         self.assertNotIn("launcher", report)
         self.assertNotIn("hmac", report)
+
+    def test_status_shows_terminal_counters_without_raw_error(self):
+        store = Mock()
+        store.status_snapshot.return_value = {
+            "enabled": True,
+            "active_turns": 1,
+            "pending": 0,
+            "pending_decisions": 0,
+            "waiting_terminal": 2,
+            "completed_turns": 3,
+            "failed_turns": 4,
+            "interrupted_turns": 5,
+            "permission_total": 6,
+            "permission_sent": 5,
+            "last_terminal_query_ok": "0",
+            "last_terminal_query_at": "100",
+            "dead": 0,
+            "last_delivery_at": None,
+            "last_error": "/private/path command=secret-token",
+        }
+        output = io.StringIO()
+        with redirect_stdout(output):
+            _status(store)
+        report = output.getvalue()
+        self.assertIn("等待终态校准：2", report)
+        self.assertIn("completed=3，failed=4，interrupted=5", report)
+        self.assertIn("总计=6，已发送=5", report)
+        self.assertIn("最近 App Server 终态查询：失败", report)
+        self.assertNotIn("/private/path", report)
+        self.assertNotIn("secret-token", report)
+
+    def test_app_server_capability_checks_generated_terminal_schema(self):
+        def generate(arguments, **_kwargs):
+            root = Path(arguments[-1]) / "v2"
+            root.mkdir(parents=True)
+            (root / "ThreadTurnsListParams.json").write_text(
+                json.dumps(
+                    {
+                        "definitions": {
+                            "TurnItemsView": {
+                                "oneOf": [{"enum": ["notLoaded"]}]
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "ThreadTurnsListResponse.json").write_text(
+                json.dumps(
+                    {
+                        "definitions": {
+                            "TurnStatus": {
+                                "enum": [
+                                    "completed",
+                                    "failed",
+                                    "interrupted",
+                                    "inProgress",
+                                ]
+                            },
+                            "Turn": {
+                                "properties": {
+                                    key: {} for key in ("id", "status", "items", "itemsView")
+                                }
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return Mock(returncode=0)
+
+        with patch("codex_notify.cli.subprocess.run", side_effect=generate):
+            self.assertTrue(_app_server_terminal_capability(Path("/codex")))
+
+    def test_app_server_capability_fails_closed_on_malformed_schema_shape(self):
+        def generate(arguments, **_kwargs):
+            root = Path(arguments[-1]) / "v2"
+            root.mkdir(parents=True)
+            (root / "ThreadTurnsListParams.json").write_text(
+                json.dumps(
+                    {
+                        "definitions": {
+                            "TurnItemsView": {"oneOf": [True]}
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "ThreadTurnsListResponse.json").write_text(
+                json.dumps(
+                    {
+                        "definitions": {
+                            "TurnStatus": {"enum": ["completed"]},
+                            "Turn": {"properties": []},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return Mock(returncode=0)
+
+        with patch("codex_notify.cli.subprocess.run", side_effect=generate):
+            self.assertFalse(_app_server_terminal_capability(Path("/codex")))
+
+    def test_app_server_capability_fails_closed_on_non_utf8_schema(self):
+        def generate(arguments, **_kwargs):
+            root = Path(arguments[-1]) / "v2"
+            root.mkdir(parents=True)
+            (root / "ThreadTurnsListParams.json").write_bytes(b"\xff")
+            return Mock(returncode=0)
+
+        with patch("codex_notify.cli.subprocess.run", side_effect=generate):
+            self.assertFalse(_app_server_terminal_capability(Path("/codex")))
 
     def test_hook_handler_requires_command_type(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -283,6 +403,11 @@ class CliTests(unittest.TestCase):
                         "hooks": {
                             event_name: [
                                 {
+                                    **(
+                                        {"matcher": ".*"}
+                                        if event_name == "PermissionRequest"
+                                        else {}
+                                    ),
                                     "hooks": [
                                         {
                                             "command": (
@@ -372,6 +497,11 @@ class CliTests(unittest.TestCase):
                         "hooks": {
                             event_name: [
                                 {
+                                    **(
+                                        {"matcher": ".*"}
+                                        if event_name == "PermissionRequest"
+                                        else {}
+                                    ),
                                     "hooks": [
                                         {
                                             "type": "command",
@@ -383,7 +513,11 @@ class CliTests(unittest.TestCase):
                                             **(
                                                 {"statusMessage": HOOK_STATUS_START}
                                                 if event_name == "UserPromptSubmit"
-                                                else {}
+                                                else (
+                                                    {"statusMessage": HOOK_STATUS_PERMISSION}
+                                                    if event_name == "PermissionRequest"
+                                                    else {}
+                                                )
                                             ),
                                         }
                                     ]
@@ -394,6 +528,7 @@ class CliTests(unittest.TestCase):
                                 "UserPromptSubmit",
                                 "SubagentStart",
                                 "SubagentStop",
+                                "PermissionRequest",
                             )
                         }
                     }
@@ -497,6 +632,10 @@ class CliTests(unittest.TestCase):
                         notify=tuple(notify),
                         previous_notify=tuple(previous),
                     ),
+                ),
+                patch(
+                    "codex_notify.cli._app_server_terminal_capability",
+                    return_value=True,
                 ),
                 patch("codex_notify.cli.subprocess.run") as run,
                 redirect_stdout(io.StringIO()),

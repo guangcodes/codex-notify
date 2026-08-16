@@ -38,6 +38,29 @@ def render_message(event_type: str, payload: dict[str, Any]) -> str:
         )
     if event_type == "completed":
         duration = _duration(int(payload.get("duration_seconds") or 0))
+        terminal_status = str(payload.get("terminal_status") or "completed")
+        title = {
+            "completed": "✅ Codex Turn 结束：已完成",
+            "failed": "❌ Codex Turn 结束：失败",
+            "interrupted": "⏹️ Codex Turn 结束：已中断",
+        }.get(terminal_status, "Codex Turn 终态")
+        status_label = {
+            "completed": "completed",
+            "failed": "failed",
+            "interrupted": "interrupted",
+        }.get(terminal_status, "unknown")
+        if not summary or summary == "（未提供摘要）":
+            summary = {
+                "completed": "Turn 已完成，请回到 Codex 查看结果。",
+                "failed": "Turn 执行失败，请回到 Codex 查看。",
+                "interrupted": "Turn 已中断，请回到 Codex 查看。",
+            }.get(terminal_status, "请回到 Codex 查看。")
+        error_category = str(payload.get("error_category") or "")
+        error_block = (
+            f"\n错误类别：{error_category}"
+            if terminal_status == "failed" and error_category
+            else ""
+        )
         lifecycle_note = (
             "\n生命周期：未观测到对应启动事件"
             if payload.get("incomplete_lifecycle")
@@ -59,15 +82,31 @@ def render_message(event_type: str, payload: dict[str, Any]) -> str:
             if lines:
                 child_block = "\n子任务结果：\n" + "\n".join(lines) + "\n"
         return (
-            "✅ Codex Turn 结束\n"
+            f"{title}\n"
             f"项目：{project}\n"
+            "可信度：confirmed\n"
+            f"状态：{status_label}\n"
             f"时间：{_clock(occurred_at)}\n"
             f"耗时：{duration}\n"
             f"结果：{summary}\n"
             f"{child_block}"
             f"Turn：{short_turn_id}\n"
             f"事件：{event_id}"
+            f"{error_block}"
             f"{lifecycle_note}"
+        )
+    if event_type == "permission":
+        reason = str(payload.get("reason") or "")
+        reason_block = f"\n原因：{reason}" if reason else ""
+        return (
+            "⚠️ Codex 需要审批\n"
+            f"项目：{project}\n"
+            "可信度：confirmed\n"
+            f"操作：{summary}\n"
+            f"时间：{_clock(occurred_at)}\n"
+            f"Turn：{short_turn_id}\n"
+            f"事件：{event_id}"
+            f"{reason_block}"
         )
     if event_type == "test":
         return f"🔔 Codex Notify 测试成功\n飞书通知链路工作正常。\n事件：{event_id}"

@@ -22,6 +22,8 @@ from .constants import (
     MAX_CHILD_RESULTS,
     OUTBOX_RETENTION_SECONDS,
     PENDING_CONFIRMATION_SECONDS,
+    TERMINAL_CALIBRATION_SECONDS,
+    TERMINAL_SCAN_RETRY_SECONDS,
 )
 from .paths import AppPaths
 from .redact import safe_summary
@@ -59,6 +61,17 @@ CREATE TABLE IF NOT EXISTS turns (
     relation_state TEXT NOT NULL DEFAULT 'UNKNOWN',
     relation_source TEXT NOT NULL DEFAULT '',
     aggregation_due_at REAL,
+    app_thread_id TEXT,
+    terminal_status TEXT,
+    terminal_source TEXT NOT NULL DEFAULT '',
+    terminal_error_category TEXT,
+    terminal_started_at REAL,
+    terminal_completed_at REAL,
+    terminal_duration_ms INTEGER,
+    terminal_check_attempts INTEGER NOT NULL DEFAULT 0,
+    terminal_check_due_at REAL,
+    terminal_calibration_deadline REAL,
+    terminal_scan_stopped_at REAL,
     PRIMARY KEY (session_id, turn_id)
 );
 
@@ -123,7 +136,7 @@ ON subagents(parent_session_id, parent_turn_id);
 """
 
 _CWD_SCRUB_SETTING = "raw_cwd_scrubbed_v1"
-_SCHEMA_VERSION = 6
+_SCHEMA_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -147,6 +160,15 @@ class SubagentEvent:
     agent_type: str
     parent_session_id: str
     parent_turn_id: str
+
+
+@dataclass(frozen=True)
+class PermissionEvent:
+    session_id: str
+    turn_id: str
+    tool_name: str
+    event_fingerprint: str
+    reason: str = ""
 
 
 class NotificationStore:
@@ -244,6 +266,17 @@ class NotificationStore:
             "relation_state": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
             "relation_source": "TEXT NOT NULL DEFAULT ''",
             "aggregation_due_at": "REAL",
+            "app_thread_id": "TEXT",
+            "terminal_status": "TEXT",
+            "terminal_source": "TEXT NOT NULL DEFAULT ''",
+            "terminal_error_category": "TEXT",
+            "terminal_started_at": "REAL",
+            "terminal_completed_at": "REAL",
+            "terminal_duration_ms": "INTEGER",
+            "terminal_check_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "terminal_check_due_at": "REAL",
+            "terminal_calibration_deadline": "REAL",
+            "terminal_scan_stopped_at": "REAL",
         }
         for name, declaration in additions.items():
             if name not in turn_columns:
@@ -374,6 +407,21 @@ class NotificationStore:
                            AND outbox.status='sent'
                      )"""
             )
+        if current_version < 7:
+            connection.execute(
+                """UPDATE turns
+                   SET terminal_status='completed',
+                       terminal_source='legacy_completed',
+                       terminal_started_at=started_at,
+                       terminal_completed_at=COALESCE(completed_at, pending_completed_at),
+                       terminal_duration_ms=CASE
+                           WHEN COALESCE(completed_at, pending_completed_at) IS NOT NULL
+                           THEN MAX(0, CAST((COALESCE(completed_at, pending_completed_at)
+                                            - started_at) * 1000 AS INTEGER))
+                           ELSE NULL END
+                   WHERE lifecycle='COMPLETED'
+                     AND terminal_status IS NULL"""
+            )
         if current_version < _SCHEMA_VERSION:
             connection.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
 
@@ -420,7 +468,9 @@ class NotificationStore:
                        aggregation_due_at=NULL
                    WHERE lifecycle='RUNNING'
                       OR classification='PENDING_ROOT_CANDIDATE'
-                      OR aggregation_due_at IS NOT NULL"""
+                      OR aggregation_due_at IS NOT NULL
+                      OR terminal_calibration_deadline IS NOT NULL
+                      OR terminal_check_due_at IS NOT NULL"""
             )
             connection.execute(
                 """UPDATE outbox
@@ -713,6 +763,92 @@ class NotificationStore:
             )
             return cursor.rowcount == 1
 
+    def record_permission_request(
+        self, event: PermissionEvent, *, now: float | None = None
+    ) -> bool:
+        if not _valid_permission_event(event):
+            return False
+        now = now if now is not None else time.time()
+        with self.managed_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            source = connection.execute(
+                "SELECT * FROM turns WHERE session_id=? AND turn_id=?",
+                (event.session_id, event.turn_id),
+            ).fetchone()
+            if source is None:
+                return False
+            if source["lifecycle"] != "RUNNING" or source["terminal_status"] is not None:
+                return False
+            is_child = source["classification"] == "CONFIRMED_CHILD"
+            root = source
+            if is_child:
+                if (
+                    source["relation_state"] != "CONFIRMED"
+                    or not source["parent_session_id"]
+                    or not source["parent_turn_id"]
+                ):
+                    return False
+                root = connection.execute(
+                    """SELECT * FROM turns
+                       WHERE session_id=? AND turn_id=?
+                         AND classification='NOTIFIABLE_ROOT'""",
+                    (source["parent_session_id"], source["parent_turn_id"]),
+                ).fetchone()
+                if root is None:
+                    return False
+            elif source["classification"] not in {
+                "PENDING_ROOT_CANDIDATE",
+                "NOTIFIABLE_ROOT",
+            }:
+                return False
+            if (
+                root["lifecycle"] != "RUNNING"
+                or root["terminal_status"] is not None
+                or not root["notify_pair"]
+                or root["suppressed"]
+            ):
+                return False
+            start = self._start_outbox_row(connection, root)
+            pending_root = root["classification"] == "PENDING_ROOT_CANDIDATE"
+            if (start is None and not pending_root) or (
+                start is not None and start["status"] == "suppressed"
+            ):
+                return False
+            operation = _permission_operation(event.tool_name)
+            if is_child:
+                operation = f"子任务审批：{operation}"
+            event_key = _event_key(
+                root["session_id"],
+                root["turn_id"],
+                f"permission:{event.event_fingerprint}",
+            )
+            cursor = self._insert_outbox(
+                connection,
+                event_key=event_key,
+                event_type="permission",
+                session_id=root["session_id"],
+                turn_id=root["turn_id"],
+                payload={
+                    "project": root["project"],
+                    "turn_id": root["turn_id"],
+                    "event_id": _delivery_id(event_key),
+                    "occurred_at": now,
+                    "summary": operation,
+                    "reason": safe_summary(event.reason, 160),
+                    "confirmed": True,
+                },
+                due_at=(
+                    max(now, float(root["decision_due_at"]))
+                    if pending_root and root["decision_due_at"] is not None
+                    else now
+                ),
+                now=now,
+                depends_on_event_key=_event_key(
+                    root["session_id"], root["turn_id"], "started"
+                ),
+            )
+            return cursor.rowcount == 1
+
     def finalize_pending(
         self,
         *,
@@ -762,6 +898,16 @@ class NotificationStore:
                         turn["turn_id"],
                     ),
                 )
+                if not confirmed_root:
+                    connection.execute(
+                        """UPDATE outbox
+                           SET status='suppressed',
+                               last_error='root identity was not confirmed'
+                           WHERE session_id=? AND turn_id=?
+                             AND event_type='permission'
+                             AND status IN ('pending', 'retry')""",
+                        (turn["session_id"], turn["turn_id"]),
+                    )
                 start_created = False
                 if confirmed_root and turn["notify_pair"] and not turn["suppressed"]:
                     start_created = self._enqueue_start(connection, turn)
@@ -811,6 +957,7 @@ class NotificationStore:
         session_id: str,
         *,
         turn_id: str | None = None,
+        app_thread_id: str | None = None,
         parent_thread_id: str | None,
         source_kind: str,
         now: float | None = None,
@@ -818,6 +965,8 @@ class NotificationStore:
         if not _valid_identifier(session_id):
             return False
         if turn_id is not None and not _valid_identifier(turn_id):
+            return False
+        if app_thread_id is not None and not _valid_identifier(app_thread_id):
             return False
         now = now if now is not None else time.time()
         confirmed_root = parent_thread_id is None and source_kind in {
@@ -830,6 +979,7 @@ class NotificationStore:
             parameters: list[Any] = [
                 "metadata_confirmed_root" if confirmed_root else "metadata_not_root",
                 "CONFIRMED" if confirmed_root else "UNKNOWN",
+                app_thread_id,
                 session_id,
             ]
             if turn_id is not None:
@@ -837,7 +987,8 @@ class NotificationStore:
             cursor = connection.execute(
                 f"""UPDATE turns
                    SET decision_reason=?, classification_source='app_server_metadata',
-                       relation_state=?, relation_source='app_server_metadata'
+                       relation_state=?, relation_source='app_server_metadata',
+                       app_thread_id=COALESCE(?, app_thread_id)
                    WHERE session_id=?
                      AND classification='PENDING_ROOT_CANDIDATE'{turn_filter}""",
                 parameters,
@@ -932,6 +1083,31 @@ class NotificationStore:
                 (turn["session_id"], turn["turn_id"]),
             ).fetchone()
             if turn["lifecycle"] == "COMPLETED":
+                if existing_completion is None and turn["terminal_status"] in {
+                    "completed",
+                    "failed",
+                    "interrupted",
+                }:
+                    connection.execute(
+                        """UPDATE turns
+                           SET pending_completed_at=COALESCE(pending_completed_at, ?),
+                               pending_completion_summary=CASE
+                                   WHEN ?<>'' THEN ?
+                                   ELSE pending_completion_summary
+                               END,
+                               pending_completion_enabled=MAX(
+                                   pending_completion_enabled, ?
+                               )
+                           WHERE session_id=? AND turn_id=?""",
+                        (
+                            now,
+                            result_summary,
+                            result_summary,
+                            1 if completion_enabled else 0,
+                            turn["session_id"],
+                            turn["turn_id"],
+                        ),
+                    )
                 return existing_completion is not None
 
             start = self._start_outbox_row(connection, turn)
@@ -954,13 +1130,17 @@ class NotificationStore:
                 """UPDATE turns
                    SET completed_at=?, pending_completed_at=?,
                        pending_completion_summary=?, pending_completion_enabled=?,
-                       lifecycle='COMPLETED', state='completed'
+                       lifecycle='COMPLETED', state='completed',
+                       terminal_check_attempts=0, terminal_check_due_at=?,
+                       terminal_calibration_deadline=?
                    WHERE session_id=? AND turn_id=?""",
                 (
                     now,
                     now,
                     result_summary,
                     1 if completion_enabled else 0,
+                    now,
+                    now + TERMINAL_CALIBRATION_SECONDS,
                     turn["session_id"],
                     turn["turn_id"],
                 ),
@@ -1005,28 +1185,243 @@ class NotificationStore:
                 return False
             if start is None:
                 return False
-            connection.execute(
-                """UPDATE turns SET aggregation_due_at=?
-                   WHERE session_id=? AND turn_id=?""",
-                (
-                    now + FINAL_AGGREGATION_SECONDS,
-                    turn["session_id"],
-                    turn["turn_id"],
-                ),
-            )
             return False
 
-    def finalize_aggregations(self, *, now: float | None = None) -> int:
+    def pending_terminal_turns(
+        self, *, now: float | None = None, limit: int = 1
+    ) -> list[tuple[str, str, str]]:
+        now = now if now is not None else time.time()
+        cutoff = now - OUTBOX_RETENTION_SECONDS
+        with self.managed_connection() as connection:
+            connection.execute(
+                """UPDATE turns
+                   SET terminal_scan_stopped_at=COALESCE(terminal_scan_stopped_at, ?),
+                       terminal_check_due_at=NULL
+                   WHERE terminal_status IS NULL AND started_at<=?
+                     AND terminal_scan_stopped_at IS NULL""",
+                (now, cutoff),
+            )
+            rows = connection.execute(
+                """SELECT session_id, turn_id, app_thread_id FROM turns
+                   WHERE classification='NOTIFIABLE_ROOT'
+                     AND notify_pair=1 AND suppressed=0
+                     AND terminal_status IS NULL
+                     AND terminal_scan_stopped_at IS NULL
+                     AND app_thread_id IS NOT NULL
+                     AND started_at>?
+                     AND COALESCE(terminal_check_due_at, started_at)<=?
+                     AND EXISTS(
+                         SELECT 1 FROM outbox
+                         WHERE outbox.session_id=turns.session_id
+                           AND outbox.turn_id=turns.turn_id
+                           AND outbox.event_type='started'
+                           AND outbox.status<>'suppressed'
+                     )
+                   ORDER BY CASE WHEN pending_completed_at IS NULL THEN 1 ELSE 0 END,
+                            COALESCE(terminal_check_due_at, started_at), started_at
+                   LIMIT ?""",
+                (cutoff, now, max(0, limit)),
+            ).fetchall()
+            return [
+                (row["session_id"], row["turn_id"], row["app_thread_id"])
+                for row in rows
+            ]
+
+    def record_terminal_probe(
+        self,
+        session_id: str,
+        turn_id: str,
+        status: object | None,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        if not _valid_identifier(session_id) or not _valid_identifier(turn_id):
+            return False
+        now = now if now is not None else time.time()
+        with self.managed_connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            turn = connection.execute(
+                "SELECT * FROM turns WHERE session_id=? AND turn_id=?",
+                (session_id, turn_id),
+            ).fetchone()
+            if turn is None or turn["suppressed"] or turn["terminal_scan_stopped_at"] is not None:
+                return False
+            if status is not None and getattr(status, "turn_id", None) != turn_id:
+                status = None
+            attempts = int(turn["terminal_check_attempts"] or 0) + 1
+            self._write_setting(connection, "last_terminal_query_at", str(now), now)
+            self._write_setting(
+                connection, "last_terminal_query_ok", "1" if status is not None else "0", now
+            )
+            if status is None:
+                delay = TERMINAL_SCAN_RETRY_SECONDS[
+                    min(attempts - 1, len(TERMINAL_SCAN_RETRY_SECONDS) - 1)
+                ]
+                fallback_due = (
+                    turn["pending_completed_at"] is not None
+                    and turn["terminal_calibration_deadline"] is not None
+                    and float(turn["terminal_calibration_deadline"]) <= now
+                )
+                next_due = now + delay
+                if (
+                    turn["pending_completed_at"] is not None
+                    and turn["terminal_calibration_deadline"] is not None
+                ):
+                    next_due = min(
+                        next_due, float(turn["terminal_calibration_deadline"])
+                    )
+                connection.execute(
+                    """UPDATE turns
+                       SET terminal_check_attempts=?, terminal_check_due_at=?
+                       WHERE session_id=? AND turn_id=? AND terminal_status IS NULL""",
+                    (
+                        attempts,
+                        None if fallback_due else next_due,
+                        session_id,
+                        turn_id,
+                    ),
+                )
+                return False
+            observed_status = getattr(status, "status", None)
+            if observed_status == "inProgress":
+                delay = TERMINAL_SCAN_RETRY_SECONDS[
+                    min(attempts - 1, len(TERMINAL_SCAN_RETRY_SECONDS) - 1)
+                ]
+                fallback_due = (
+                    turn["pending_completed_at"] is not None
+                    and turn["terminal_calibration_deadline"] is not None
+                    and float(turn["terminal_calibration_deadline"]) <= now
+                )
+                next_due = now + delay
+                if (
+                    turn["pending_completed_at"] is not None
+                    and turn["terminal_calibration_deadline"] is not None
+                ):
+                    next_due = min(
+                        next_due, float(turn["terminal_calibration_deadline"])
+                    )
+                connection.execute(
+                    """UPDATE turns
+                       SET terminal_check_attempts=?, terminal_check_due_at=?
+                       WHERE session_id=? AND turn_id=? AND terminal_status IS NULL""",
+                    (
+                        attempts,
+                        None if fallback_due else next_due,
+                        session_id,
+                        turn_id,
+                    ),
+                )
+                return False
+            if observed_status not in {"completed", "failed", "interrupted"}:
+                return False
+            existing = turn["terminal_status"]
+            if existing is not None:
+                if existing != observed_status:
+                    self._increment_setting(connection, "terminal_status_conflicts", now)
+                return False
+            completed_at = getattr(status, "completed_at", None)
+            started_at = getattr(status, "started_at", None)
+            duration_ms = getattr(status, "duration_ms", None)
+            error_category = getattr(status, "error_category", None)
+            effective_completed = float(completed_at) if completed_at is not None else now
+            connection.execute(
+                """UPDATE turns
+                   SET terminal_status=?, terminal_source='app_server',
+                       terminal_error_category=?, terminal_started_at=?,
+                       terminal_completed_at=?, terminal_duration_ms=?,
+                       completed_at=COALESCE(completed_at, ?),
+                       pending_completed_at=COALESCE(pending_completed_at, ?),
+                       lifecycle='COMPLETED', state=?,
+                       terminal_check_attempts=?, terminal_check_due_at=NULL,
+                       terminal_calibration_deadline=NULL,
+                       aggregation_due_at=?
+                   WHERE session_id=? AND turn_id=? AND terminal_status IS NULL""",
+                (
+                    observed_status,
+                    error_category,
+                    started_at,
+                    completed_at,
+                    duration_ms,
+                    effective_completed,
+                    effective_completed,
+                    observed_status,
+                    attempts,
+                    now + FINAL_AGGREGATION_SECONDS,
+                    session_id,
+                    turn_id,
+                ),
+            )
+            return True
+
+    @staticmethod
+    def _increment_setting(
+        connection: sqlite3.Connection, key: str, now: float
+    ) -> None:
+        row = connection.execute(
+            "SELECT value FROM settings WHERE key=?", (key,)
+        ).fetchone()
+        try:
+            value = int(row["value"]) + 1 if row is not None else 1
+        except (TypeError, ValueError):
+            value = 1
+        NotificationStore._write_setting(connection, key, str(value), now)
+
+    def finalize_aggregations(
+        self, *, now: float | None = None, require_due_probe: bool = False
+    ) -> int:
         now = now if now is not None else time.time()
         finalized = 0
         with self.managed_connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            probe_gate = (
+                " AND (app_thread_id IS NULL OR terminal_check_due_at IS NULL)"
+                if require_due_probe
+                else ""
+            )
+            connection.execute(
+                f"""UPDATE turns
+                   SET terminal_status='completed',
+                       terminal_source='agent_turn_complete_fallback',
+                       terminal_started_at=started_at,
+                       terminal_completed_at=COALESCE(pending_completed_at, completed_at, ?),
+                       terminal_duration_ms=MAX(
+                           0,
+                           CAST((COALESCE(pending_completed_at, completed_at, ?) - started_at)
+                                * 1000 AS INTEGER)
+                       ),
+                       terminal_check_due_at=NULL,
+                       terminal_calibration_deadline=NULL,
+                       aggregation_due_at=COALESCE(pending_completed_at, completed_at, ?) + ?
+                   WHERE classification='NOTIFIABLE_ROOT'
+                     AND terminal_status IS NULL
+                     AND pending_completed_at IS NOT NULL
+                     AND notify_pair=1 AND suppressed=0
+                     AND EXISTS(
+                         SELECT 1 FROM outbox
+                         WHERE outbox.session_id=turns.session_id
+                           AND outbox.turn_id=turns.turn_id
+                           AND outbox.event_type='started'
+                           AND outbox.status<>'suppressed'
+                     )
+                     {probe_gate}
+                     AND terminal_calibration_deadline<=?""",
+                (now, now, now, FINAL_AGGREGATION_SECONDS, now),
+            )
             roots = connection.execute(
                 """SELECT * FROM turns
                    WHERE classification='NOTIFIABLE_ROOT'
                      AND lifecycle='COMPLETED'
+                     AND terminal_status IN ('completed', 'failed', 'interrupted')
+                     AND notify_pair=1 AND suppressed=0
                      AND aggregation_due_at IS NOT NULL
                      AND aggregation_due_at<=?
+                     AND EXISTS(
+                         SELECT 1 FROM outbox
+                         WHERE outbox.session_id=turns.session_id
+                           AND outbox.turn_id=turns.turn_id
+                           AND outbox.event_type='started'
+                           AND outbox.status<>'suppressed'
+                     )
                    ORDER BY completed_at""",
                 (now,),
             ).fetchall()
@@ -1079,7 +1474,7 @@ class NotificationStore:
                     connection,
                     root,
                     root["pending_completion_summary"],
-                    float(root["completed_at"] or now),
+                    float(root["terminal_completed_at"] or root["completed_at"] or now),
                     incomplete_lifecycle=start is None,
                     depends_on_start=start is not None,
                     child_results=child_results,
@@ -1119,9 +1514,15 @@ class NotificationStore:
                 "turn_id": turn["turn_id"],
                 "event_id": _delivery_id(event_key),
                 "occurred_at": completed_at,
-                "started_at": turn["started_at"],
-                "duration_seconds": max(0, int(completed_at - turn["started_at"])),
+                "started_at": turn["terminal_started_at"] or turn["started_at"],
+                "duration_seconds": (
+                    max(0, int(turn["terminal_duration_ms"] / 1000))
+                    if turn["terminal_duration_ms"] is not None
+                    else max(0, int(completed_at - turn["started_at"]))
+                ),
                 "summary": result_summary,
+                "terminal_status": turn["terminal_status"] or "completed",
+                "error_category": turn["terminal_error_category"],
                 "incomplete_lifecycle": incomplete_lifecycle,
                 "child_results": child_results or [],
                 "omitted_child_results": omitted_child_results,
@@ -1187,7 +1588,11 @@ class NotificationStore:
         )
 
     def claim_due(
-        self, *, limit: int, now: float | None = None
+        self,
+        *,
+        limit: int,
+        now: float | None = None,
+        dependent_only: bool = False,
     ) -> list[dict[str, Any]]:
         now = now if now is not None else time.time()
         connection = self.connect()
@@ -1209,9 +1614,20 @@ class NotificationStore:
                          WHERE dependency.event_key=dependent.depends_on_event_key
                            AND dependency.status IN ('dead', 'suppressed'))"""
             )
+            dependent_filter = (
+                " AND depends_on_event_key IS NOT NULL" if dependent_only else ""
+            )
             rows = connection.execute(
-                """SELECT * FROM outbox
+                f"""SELECT * FROM outbox
                    WHERE status IN ('pending', 'retry') AND next_attempt_at<=?
+                     {dependent_filter}
+                     AND (
+                         event_type<>'permission'
+                         OR EXISTS(
+                             SELECT 1 FROM turns
+                             WHERE turns.session_id=outbox.session_id
+                               AND turns.turn_id=outbox.turn_id
+                               AND turns.classification='NOTIFIABLE_ROOT'))
                      AND (
                          depends_on_event_key IS NULL
                          OR NOT EXISTS(
@@ -1418,6 +1834,31 @@ class NotificationStore:
                        WHERE classification='CONFLICT' OR relation_state='CONFLICT'
                    )"""
             ).fetchone()["count"]
+            terminal_counts = {
+                row["terminal_status"]: row["count"]
+                for row in connection.execute(
+                    """SELECT terminal_status, COUNT(*) AS count FROM turns
+                       WHERE terminal_status IN ('completed', 'failed', 'interrupted')
+                         AND classification='NOTIFIABLE_ROOT'
+                       GROUP BY terminal_status"""
+                )
+            }
+            waiting_terminal = connection.execute(
+                """SELECT COUNT(*) AS count FROM turns
+                   WHERE classification='NOTIFIABLE_ROOT'
+                     AND notify_pair=1 AND suppressed=0
+                     AND terminal_status IS NULL
+                     AND terminal_scan_stopped_at IS NULL
+                     AND started_at>?""",
+                (now - OUTBOX_RETENTION_SECONDS,),
+            ).fetchone()["count"]
+            permission_total = connection.execute(
+                "SELECT COUNT(*) AS count FROM outbox WHERE event_type='permission'"
+            ).fetchone()["count"]
+            permission_sent = connection.execute(
+                """SELECT COUNT(*) AS count FROM outbox
+                   WHERE event_type='permission' AND status='sent'"""
+            ).fetchone()["count"]
             return {
                 "enabled": enabled,
                 "active_turns": active,
@@ -1427,6 +1868,14 @@ class NotificationStore:
                 "pending_decisions": pending_decisions,
                 "unverified_turns": unverified_turns,
                 "conflict_relations": conflict_relations,
+                "waiting_terminal": waiting_terminal,
+                "completed_turns": terminal_counts.get("completed", 0),
+                "failed_turns": terminal_counts.get("failed", 0),
+                "interrupted_turns": terminal_counts.get("interrupted", 0),
+                "permission_total": permission_total,
+                "permission_sent": permission_sent,
+                "last_terminal_query_ok": settings.get("last_terminal_query_ok"),
+                "last_terminal_query_at": settings.get("last_terminal_query_at"),
                 "dead": counts.get("dead", 0),
                 "last_delivery_at": settings.get("last_delivery_at"),
                 "last_error": settings.get("last_error"),
@@ -1456,3 +1905,26 @@ def _valid_subagent_event(event: SubagentEvent) -> bool:
         _valid_identifier(value)
         for value in (event.agent_id, event.parent_session_id, event.parent_turn_id)
     )
+
+
+def _valid_permission_event(event: PermissionEvent) -> bool:
+    return (
+        _valid_identifier(event.session_id)
+        and _valid_identifier(event.turn_id)
+        and isinstance(event.event_fingerprint, str)
+        and len(event.event_fingerprint) == 64
+        and all(character in "0123456789abcdef" for character in event.event_fingerprint)
+    )
+
+
+def _permission_operation(tool_name: str) -> str:
+    normalized = "".join(character for character in tool_name.lower() if character.isalnum())
+    if any(marker in normalized for marker in ("shell", "command", "exec", "bash")):
+        return "命令执行审批"
+    if any(marker in normalized for marker in ("applypatch", "filewrite", "edit", "write")):
+        return "文件变更审批"
+    if any(marker in normalized for marker in ("network", "websearch", "web", "http")):
+        return "网络访问审批"
+    if "mcp" in normalized:
+        return "MCP 工具审批"
+    return "工具权限审批"

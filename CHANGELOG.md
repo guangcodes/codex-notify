@@ -4,6 +4,11 @@
 
 ## 未发布
 
+- 新增确定的 `PermissionRequest` 审批通知：严格根/子 Turn 归属、失败关闭、稳定幂等、通用操作分类和入库前脱敏；Hook 永不返回 allow/deny，也不保存原始 payload。
+- 新增一次性只读 `thread/turns/list(itemsView="notLoaded")` 终态读取，校准 `completed`、`failed`、`interrupted`，拒绝非空 Items、未知状态/字段、超时、超大输出和身份冲突。
+- 新增有界终态补偿扫描、查询退避、24 小时停止、App Server 单实例锁，以及 `agent-turn-complete` 校准窗口后的 completed 兼容回退。
+- SQLite 升级到 v7，增量保存精确 App Thread ID、终态、结构化错误类别、查询调度和诊断字段；旧 completed 数据可重复迁移且不重放历史通知。
+- 扩展终态与审批消息、`status` 统计和 `doctor` schema 检查；安装器幂等管理第五个 PermissionRequest Hook，普通卸载仍保留数据库和日志。
 - 避免脱敏测试中的 Stripe 和 Slack 假凭据以连续字面量出现，防止 Secret scanning 误报。
 - 补齐版本、安全、贡献、第三方依赖和历史发布验收文档之间的入口与事实边界。
 
