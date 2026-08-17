@@ -237,7 +237,6 @@ class InstallerTests(unittest.TestCase):
             "UserPromptSubmit",
             "SubagentStart",
             "SubagentStop",
-            "PermissionRequest",
             "PreToolUse",
         ):
             commands = [
@@ -249,12 +248,7 @@ class InstallerTests(unittest.TestCase):
                 sum(command.endswith(f"hook {event_name}") for command in commands),
                 1,
             )
-        permission_group = document["hooks"]["PermissionRequest"][-1]
-        self.assertEqual(permission_group["matcher"], ".*")
-        self.assertEqual(
-            permission_group["hooks"][0]["statusMessage"],
-            "Queueing confirmed Codex permission notification",
-        )
+        self.assertNotIn("PermissionRequest", document["hooks"])
         pretool_group = document["hooks"]["PreToolUse"][-1]
         self.assertEqual(pretool_group["matcher"], "^request_user_input$")
         self.assertEqual(
@@ -843,6 +837,34 @@ class InstallerTests(unittest.TestCase):
         ]
         self.assertEqual(stop_commands, ["/usr/bin/existing-hook"])
 
+    def test_install_removes_historical_managed_permission_hook(self):
+        self.installer.paths.ensure_runtime_dirs()
+        self.installer.paths.runner.write_text(
+            f"#!{self.installer.python_executable}\n",
+            encoding="utf-8",
+        )
+        self.installer.paths.runner.chmod(0o700)
+        document = json.loads(self.installer.hooks_file.read_text(encoding="utf-8"))
+        document["hooks"]["PermissionRequest"] = [
+            {
+                "matcher": ".*",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": self.installer._hook_command("PermissionRequest"),
+                        "timeout": 5,
+                        "statusMessage": "Queueing confirmed Codex permission notification",
+                    }
+                ],
+            }
+        ]
+        self.installer.hooks_file.write_text(json.dumps(document), encoding="utf-8")
+
+        self.installer.install(start_agent=False)
+
+        upgraded = json.loads(self.installer.hooks_file.read_text(encoding="utf-8"))
+        self.assertNotIn("PermissionRequest", upgraded["hooks"])
+
     def test_uninstall_removes_only_our_hooks(self):
         self.installer.install(start_agent=False)
         self.installer.uninstall()
@@ -920,9 +942,26 @@ class InstallerTests(unittest.TestCase):
         )
 
     def test_permission_matcher_drift_fails_closed(self):
-        self.installer.install(start_agent=False)
+        self.installer.paths.ensure_runtime_dirs()
+        self.installer.paths.runner.write_text(
+            f"#!{self.installer.python_executable}\n",
+            encoding="utf-8",
+        )
+        self.installer.paths.runner.chmod(0o700)
         document = json.loads(self.installer.hooks_file.read_text(encoding="utf-8"))
-        document["hooks"]["PermissionRequest"][-1]["matcher"] = "Shell"
+        document["hooks"]["PermissionRequest"] = [
+            {
+                "matcher": "Shell",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": self.installer._hook_command("PermissionRequest"),
+                        "timeout": 5,
+                        "statusMessage": "Queueing confirmed Codex permission notification",
+                    }
+                ],
+            }
+        ]
         drifted = json.dumps(document)
         self.installer.hooks_file.write_text(drifted, encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "PermissionRequest.*漂移"):

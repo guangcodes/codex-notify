@@ -20,11 +20,7 @@ from codex_notify.cli import (
     main,
 )
 from codex_notify.computer_use import ComputerUseIntegration, encode_previous_notify
-from codex_notify.constants import (
-    HOOK_STATUS_PERMISSION,
-    HOOK_STATUS_REQUEST_USER_INPUT,
-    HOOK_STATUS_START,
-)
+from codex_notify.constants import HOOK_STATUS_REQUEST_USER_INPUT, HOOK_STATUS_START
 from codex_notify.experimental_status import ExperimentalCapability
 from codex_notify.installer import LEGACY_LAUNCH_AGENT_LABEL
 from codex_notify.keychain import FeishuCredentials
@@ -34,6 +30,7 @@ class CliTests(unittest.TestCase):
     def test_legacy_hooks_are_accepted_as_noops(self):
         with patch("codex_notify.cli.NotificationStore") as store:
             self.assertEqual(main(["hook", "Stop"]), 0)
+            self.assertEqual(main(["hook", "PermissionRequest"]), 0)
         store.assert_not_called()
         with patch("codex_notify.cli.hook_main", return_value=0) as hook_main:
             self.assertEqual(main(["hook", "PreToolUse"]), 0)
@@ -105,7 +102,10 @@ class CliTests(unittest.TestCase):
         report = output.getvalue()
         self.assertIn("等待终态校准：2", report)
         self.assertIn("completed=3，failed=4，interrupted=5", report)
-        self.assertIn("总计=6，已发送=5", report)
+        self.assertIn(
+            "历史审批通知（旧版本，当前已禁用）：总计=6，已发送=5",
+            report,
+        )
         self.assertIn("最近 App Server 终态查询：失败", report)
         self.assertNotIn("/private/path", report)
         self.assertNotIn("secret-token", report)
@@ -525,13 +525,9 @@ class CliTests(unittest.TestCase):
                             event_name: [
                                 {
                                     **(
-                                        {"matcher": ".*"}
-                                        if event_name == "PermissionRequest"
-                                        else (
-                                            {"matcher": "^request_user_input$"}
-                                            if event_name == "PreToolUse"
-                                            else {}
-                                        )
+                                        {"matcher": "^request_user_input$"}
+                                        if event_name == "PreToolUse"
+                                        else {}
                                     ),
                                     "hooks": [
                                         {
@@ -623,13 +619,9 @@ class CliTests(unittest.TestCase):
                             event_name: [
                                 {
                                     **(
-                                        {"matcher": ".*"}
-                                        if event_name == "PermissionRequest"
-                                        else (
-                                            {"matcher": "^request_user_input$"}
-                                            if event_name == "PreToolUse"
-                                            else {}
-                                        )
+                                        {"matcher": "^request_user_input$"}
+                                        if event_name == "PreToolUse"
+                                        else {}
                                     ),
                                     "hooks": [
                                         {
@@ -643,13 +635,9 @@ class CliTests(unittest.TestCase):
                                                 {"statusMessage": HOOK_STATUS_START}
                                                 if event_name == "UserPromptSubmit"
                                                 else (
-                                                    {"statusMessage": HOOK_STATUS_PERMISSION}
-                                                    if event_name == "PermissionRequest"
-                                                    else (
-                                                        {"statusMessage": HOOK_STATUS_REQUEST_USER_INPUT}
-                                                        if event_name == "PreToolUse"
-                                                        else {}
-                                                    )
+                                                    {"statusMessage": HOOK_STATUS_REQUEST_USER_INPUT}
+                                                    if event_name == "PreToolUse"
+                                                    else {}
                                                 )
                                             ),
                                         }
@@ -661,7 +649,6 @@ class CliTests(unittest.TestCase):
                                 "UserPromptSubmit",
                                 "SubagentStart",
                                 "SubagentStop",
-                                "PermissionRequest",
                                 "PreToolUse",
                             )
                         }

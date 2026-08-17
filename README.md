@@ -21,14 +21,14 @@
 ```text
 SessionStart ────────────────→ 只记录会话生命周期和上下文压缩来源
 UserPromptSubmit ────────────→ PENDING_ROOT_CANDIDATE（统一等待 5 秒）
-PermissionRequest ───────────→ 仅精确归属已确认根 Turn 后登记审批通知
+PermissionRequest ───────────→ 当前不能证明等待人工审批，始终静默
 PreToolUse(request_user_input) → 仅精确归属已确认根 Turn 后登记尽力问题提醒
 SubagentStart/SubagentStop ──→ 保存原始 Hook 身份并推导唯一活动父 Turn
 agent-turn-complete ─────────→ 权威正常完成信号，触发有界终态校准
                                   ↓
                               一次性 metadata-only App Server 查询
                                   ↓
-                         completed / failed / interrupted
+                    completed / failed / interrupted（静默）
                                   ↗
 LaunchAgent 补偿扫描 ────────→ 只查询已登记且未终态的精确根 Thread/Turn
                                   ↓
@@ -51,7 +51,7 @@ account/rateLimits/read ─────→ 账户限流全局状态（实验，�
 
 - `classification`：`PENDING_ROOT_CANDIDATE`、`NOTIFIABLE_ROOT`、`CONFIRMED_CHILD`、`UNVERIFIED`、`CONFLICT`
 - `lifecycle`：`RUNNING`、`COMPLETED`
-- `terminal_status`：`completed`、`failed`、`interrupted`；尚未校准时为空
+- `terminal_status`：仅持久化可通知的 `completed`、`failed`；App Server 的 `interrupted` 观测不可靠，保持静默并继续等待
 - 抑制状态：`suppressed` 与可空的 `suppression_reason`
 
 所有具有有效 `session_id + turn_id` 的 `UserPromptSubmit` 都先进入相同的 5 秒窗口。异步 worker 只使用 ChatGPT Desktop 内置的 Codex 启动一次性 App Server：优先调用 `thread/read(includeTurns=false)`；当 Hook `session_id` 不能直接读取时，使用 `thread/list(useStateDbOnly=true)` 在交互 Thread 中做唯一 ID 候选映射，再用 `thread/read(includeTurns=false)` 校准，并通过 `thread/turns/list(itemsView="notLoaded")` 确认 Hook `turn_id` 确实属于该 Thread。代码仅解析身份、来源和时间元数据；Turn Items 必须为空，列表中的 `preview` 不会保存或转发。只有精确 Turn 归属成立、`parentThreadId=null` 且来源为 `vscode`、`appServer` 或 `cli` 时才转为 `NOTIFIABLE_ROOT`；查询缺失、失败、超时、字段未知或证据冲突时保持静默。
@@ -60,15 +60,15 @@ account/rateLimits/read ─────→ 账户限流全局状态（实验，�
 
 完成处理只使用精确的 `(session/thread id, turn_id)`，永不按相同 `turn_id` 跨会话回退。`UNKNOWN`、`UNVERIFIED` 和 `CONFLICT` 均不通知、不合并，也不为缺少已确认来源的完成事件发送独立通知。
 
-`PermissionRequest` Hook 不批准、不拒绝，也不修改工具输入；它只校验身份、对原始 JSON 计算本地幂等指纹、提取通用操作类型，然后写入 SQLite。确认窗口内到达的安全事件会等待冻结的根身份结论，确认失败则永久抑制；已确认子 Turn 只有在精确关联到已确认根 Turn 时才以“子任务审批”归入根 Turn。关系不确定时静默，任意 `tool_input` 自由文本、原始命令、路径、工具参数和 Hook payload 均不落库。
+`PermissionRequest` 只能证明发生过一次权限检查，无法区分自动审查、人工等待、批准、拒绝或请求已经失效。为避免把瞬时权限检查误报为“Codex 需要审批”，当前版本不安装该 Hook，兼容入口也始终静默且不写入 SQLite；升级时会移除旧版自有 Hook，并抑制尚未发送的历史 permission 队列项。`status` 中的审批计数明确标为旧版本历史记录，不代表当前存在待审批操作。将来只有取得权威、稳定的人工等待及结束状态后才会恢复此类通知。
 
-后台 worker 只对本地已经精确确认并登记通知的根 Turn 调用 `thread/turns/list(itemsView="notLoaded")`。响应中的 `itemsView` 必须为 `notLoaded` 且 `items` 必须为空；只提取 Turn ID、状态、开始/完成时间、耗时和封闭集合内的结构化错误类别。`agent-turn-complete` 到达后先进行有界校准，窗口结束仍不可读时沿用原有 completed 语义。没有正常完成信号时，轻量补偿扫描每轮最多查询一个候选，失败有界退避，24 小时后停止。每个根 Turn 仍只有一个终态事件，且依赖对应 started 事件先发送。
+后台 worker 只对本地已经精确确认并登记通知的根 Turn 调用 `thread/turns/list(itemsView="notLoaded")`。响应中的 `itemsView` 必须为 `notLoaded` 且 `items` 必须为空；只提取 Turn ID、状态、开始/完成时间、耗时和封闭集合内的结构化错误类别。`completed` 与 `failed` 必须同时具有完成时间才可成为通知终态；当前 App Server 的 `interrupted` 可能只是用户追加消息造成的瞬时状态，因此无条件静默，不进入发送队列。`agent-turn-complete` 到达后先进行有界校准，窗口结束仍不可读时沿用原有 completed 语义。没有正常完成信号时，轻量补偿扫描每轮最多查询一个候选，失败有界退避，24 小时后停止。每个根 Turn 仍只有一个终态事件，且依赖对应 started 事件先发送。
 
 根 Turn 完成后等待固定 5 秒，以父 Turn 的 `last-assistant-message` 为主结果，并按 `SubagentStart.started_at` 合并已完成的确认子结果。子结果使用确定性脱敏与截断，最多 8 项、每项最多 200 字；窗口后到达的结果不补发。整个过程不调用模型生成摘要。
 
 ## 开关
 
-- `codex-notify on`：允许新候选在证据确认后生成根启动、审批和配对终态事件。
+- `codex-notify on`：允许新候选在证据确认后生成根启动和配对终态事件。
 - `codex-notify off`：阻止新的启动事件；已经生成启动事件的 Turn 仍可发送配对完成。
 - `codex-notify off --now`：在发送锁内等待当前投递结束，然后永久抑制运行中 Turn、待校准 Turn、pending 候选和未发送队列。重新 `on` 不会恢复这些 Turn。
 - `codex-notify test`：显式测试操作，不受 Turn 分类和 `off --now` 影响。
@@ -95,7 +95,6 @@ Turn 级事件使用等价于以下元组的唯一键：
 ```text
 (session_id, turn_id, "started")
 (session_id, turn_id, "completed")
-(session_id, turn_id, "permission:<hook-payload-fingerprint>")
 (session_id, turn_id, "request-user-input:<hook-payload-fingerprint>")
 ```
 
@@ -155,7 +154,7 @@ codex-notify install
 
 - `~/.codex/codex-notify/lib/`：不依赖 venv 或源码目录的私有 runtime。
 - `~/.codex/codex-notify/runner.py`：Hook、通知链和 LaunchAgent 使用的私有入口。
-- `~/.codex/hooks.json`：`SessionStart`、`UserPromptSubmit`、`SubagentStart`、`SubagentStop`、`PermissionRequest`，以及精确匹配 `request_user_input` 的 `PreToolUse` Hook。
+- `~/.codex/hooks.json`：`SessionStart`、`UserPromptSubmit`、`SubagentStart`、`SubagentStop`，以及精确匹配 `request_user_input` 的 `PreToolUse` Hook；升级时移除旧版自有 `PermissionRequest` Hook。
 - `~/.codex/config.toml`：保留 Computer Use 顶层 `notify`，只写入指向私有 runner 的 `--previous-notify`。
 - `~/Library/LaunchAgents/io.github.guangcodes.codex-notify.plist`：每 10 秒处理一次发件队列的当前用户后台任务。
 
@@ -173,7 +172,7 @@ codex-notify configure
 
 ### 4. 重启 Codex 并信任 Hook
 
-部署后必须重启 Codex，在 `/hooks` 中逐项检查并信任六个 Hook。自动安装和测试不能代替这项人工授权。
+部署后必须重启 Codex，在 `/hooks` 中逐项检查并信任五个 Hook。自动安装和测试不能代替这项人工授权。
 
 ### 5. 验证并启用通知
 
@@ -184,10 +183,10 @@ codex-notify on
 codex-notify status
 ```
 
-- `doctor` 应确认凭据、六个 Hook 的命令、matcher 与元数据、bundled App Server 终态 schema、三个实验 capability、Computer Use 通知链、runtime 版本和 LaunchAgent；Hook 是否已被用户信任仍以 Codex `/hooks` 为准。
+- `doctor` 应确认凭据、五个 Hook 的命令、matcher 与元数据、bundled App Server 终态 schema、三个实验 capability、Computer Use 通知链、runtime 版本和 LaunchAgent；Hook 是否已被用户信任仍以 Codex `/hooks` 为准。
 - `test` 应向飞书发送一条显式测试消息。
 - `on` 允许后续符合策略的 Turn 生成通知；项目默认关闭，不会因安装自动开启。
-- `status` 显示当前开关、实验 capability 与子开关、等待终态校准数、三类终态统计、审批与 best-effort 通知统计、最近一次实验状态成功查询时间和终态 App Server 查询结果、队列和投递概况；不会打印原始错误、命令或路径。
+- `status` 显示当前开关、实验 capability 与子开关、等待终态校准数、三类终态统计、历史审批与 best-effort 通知统计、最近一次实验状态成功查询时间和终态 App Server 查询结果、队列和投递概况；不会打印原始错误、命令或路径。
 
 如果验证失败，不要反复覆盖配置；先根据 `doctor` 的具体失败项检查 Computer Use、Hook 信任、Keychain 或 LaunchAgent。
 
@@ -266,13 +265,14 @@ python3 ~/.codex/codex-notify/runner.py uninstall
 
 ## 隐私与本地数据
 
-发送到飞书的确定通知包含项目名称、事件类型、confirmed 标识、安全摘要、时间、耗时、短 Turn ID 和事件 ID；尽力通知明确包含 best_effort、signal_source、安全信号 ID 和“可能/建议检查”文案。全局 MCP/账户状态不伪造 Turn ID。失败通知最多包含封闭集合内的结构化错误类别。摘要在进入 SQLite 前经过敏感格式检测、整段替换和长度截断，但正则脱敏不能保证识别所有业务机密；不要在高敏感项目中启用通知。App Server 原始响应、preview、Prompt、Turn Items、request_user_input 问题与选项、MCP tools/resources/schema、OAuth URL、reset credit、完整命令、完整路径、工具原始参数、`error.additionalDetails`、环境变量值、凭据和 Token 不会保存或转发。
+发送到飞书的确定通知包含项目名称、事件类型、confirmed 标识、安全摘要、时间、耗时、短 Turn ID 和事件 ID；尽力通知明确包含 best_effort、signal_source、安全信号 ID 和“可能/建议检查”文案。全局 MCP/账户状态不伪造 Turn ID。失败通知最多包含封闭集合内的结构化错误类别。摘要在进入 SQLite 前会将命中的凭据和本地路径分别替换为 `[敏感信息已打码]` 与 `[本地路径已打码]`，保留其余任务上下文后再执行长度截断；正则脱敏不能保证识别所有业务机密，不要在高敏感项目中启用通知。App Server 原始响应、preview、Prompt、Turn Items、request_user_input 问题与选项、MCP tools/resources/schema、OAuth URL、reset credit、完整命令、完整路径、工具原始参数、`error.additionalDetails`、环境变量值、凭据和 Token 不会保存或转发。
 
 飞书 Webhook 和签名密钥只保存在当前用户的 macOS Keychain。运行数据位于 `~/.codex/codex-notify/`，SQLite 与日志仅对当前用户开放。未发送项最多重试 24 小时，超过期限后在 SQLite 中标记为永久失败；飞书已接收而本地未收到确认时，重试可能产生相同事件 ID 的重复消息。普通卸载保留 SQLite 与日志，只有 `uninstall --purge` 删除运行数据。
 
 ## 已知边界
 
-- `agent-turn-complete` 仍是正常完成的权威信号；App Server 补偿扫描只能在精确已登记范围内发现持久化的 completed、failed 或 interrupted 状态。
+- `agent-turn-complete` 仍是正常完成的权威信号；App Server 补偿扫描只能在精确已登记范围内确认带完成时间的 `completed` 或 `failed`。`interrupted` 当前无权威、稳定的永久中断证据，始终静默。
+- `PermissionRequest` 当前没有权威的“仍在等待人工审批”及结束状态，始终静默；`status` 中的审批计数仅保留历史版本记录。
 - 父子关系是受约束推导，只优化能够由唯一活动父 Turn 和精确子身份共同确认的情况；无法确认时宁可静默。
 - metadata-only 校准依赖 ChatGPT Desktop bundled Codex 的实验性 App Server 契约；缺失、漂移或失败只会降低通知覆盖率，不影响 Codex Desktop。
 - `request_user_input`、MCP 登录状态和账户限流是默认关闭的 best-effort 实验能力；mock/schema 验证不等于真实环境已经触发或无副作用。

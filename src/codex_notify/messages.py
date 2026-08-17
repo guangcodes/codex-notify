@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from .redact import safe_summary
+
 
 def _clock(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp).astimezone().strftime("%m-%d %H:%M:%S")
@@ -21,8 +23,10 @@ def _duration(seconds: int) -> str:
 
 
 def render_message(event_type: str, payload: dict[str, Any]) -> str:
-    project = payload.get("project") or "未知项目"
-    summary = payload.get("summary") or "（未提供摘要）"
+    # Re-sanitize at the final delivery boundary so legacy queued payloads
+    # created by an older redaction policy cannot bypass current protections.
+    project = safe_summary(payload.get("project"), 120) or "未知项目"
+    summary = safe_summary(payload.get("summary"), 300) or "（未提供摘要）"
     occurred_at = float(payload.get("occurred_at") or 0)
     turn_id = str(payload.get("turn_id") or "-")
     short_turn_id = turn_id[:12]
@@ -55,7 +59,7 @@ def render_message(event_type: str, payload: dict[str, Any]) -> str:
                 "failed": "Turn 执行失败，请回到 Codex 查看。",
                 "interrupted": "Turn 已中断，请回到 Codex 查看。",
             }.get(terminal_status, "请回到 Codex 查看。")
-        error_category = str(payload.get("error_category") or "")
+        error_category = safe_summary(payload.get("error_category"), 80)
         error_block = (
             f"\n错误类别：{error_category}"
             if terminal_status == "failed" and error_category
@@ -73,8 +77,10 @@ def render_message(event_type: str, payload: dict[str, Any]) -> str:
             for child in children:
                 if not isinstance(child, dict):
                     continue
-                agent_type = str(child.get("agent_type") or "subagent")
-                child_summary = str(child.get("summary") or "（无可用结果）")
+                agent_type = safe_summary(child.get("agent_type"), 80) or "subagent"
+                child_summary = (
+                    safe_summary(child.get("summary"), 300) or "（无可用结果）"
+                )
                 lines.append(f"- {agent_type}：{child_summary}")
             omitted = int(payload.get("omitted_child_results") or 0)
             if omitted > 0:
@@ -96,12 +102,13 @@ def render_message(event_type: str, payload: dict[str, Any]) -> str:
             f"{lifecycle_note}"
         )
     if event_type == "permission":
-        reason = str(payload.get("reason") or "")
+        reason = safe_summary(payload.get("reason"), 200)
         reason_block = f"\n原因：{reason}" if reason else ""
         return (
-            "⚠️ Codex 需要审批\n"
+            "⚠️ Codex 权限检查记录\n"
             f"项目：{project}\n"
-            "可信度：confirmed\n"
+            "归属可信度：confirmed\n"
+            "状态：不代表当前仍在等待人工审批\n"
             f"操作：{summary}\n"
             f"时间：{_clock(occurred_at)}\n"
             f"Turn：{short_turn_id}\n"
@@ -121,7 +128,9 @@ def render_message(event_type: str, payload: dict[str, Any]) -> str:
             f"事件：{event_id}"
         )
     if event_type == "experimental_mcp_auth":
-        display_name = str(payload.get("display_name") or "某 MCP 服务")
+        display_name = (
+            safe_summary(payload.get("display_name"), 80) or "某 MCP 服务"
+        )
         return (
             "🔐 Codex 全局状态提醒\n"
             f"{display_name} 可能需要重新登录\n"

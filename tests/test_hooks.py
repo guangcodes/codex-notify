@@ -118,7 +118,7 @@ class HookTests(unittest.TestCase):
         )
         self.assertTrue(self.store.paths.error_log.exists())
 
-    def test_permission_request_is_confirmed_idempotent_and_does_not_store_raw_payload(self):
+    def test_permission_request_is_always_silent_and_does_not_store_raw_payload(self):
         self.store.record_start(
             self.store_event("session", "turn", "/projects/demo"), now=10
         )
@@ -153,14 +153,22 @@ class HookTests(unittest.TestCase):
             rows = connection.execute(
                 "SELECT event_type, payload_json FROM outbox ORDER BY id"
             ).fetchall()
-        self.assertEqual([row["event_type"] for row in rows], ["started", "permission"])
-        stored = rows[-1]["payload_json"]
-        self.assertIn("命令执行审批", stored)
-        self.assertNotIn("curl", stored)
-        self.assertNotIn("/private/project/full/path.txt", stored)
+        self.assertEqual([row["event_type"] for row in rows], ["started"])
         database_bytes = self.store.paths.database.read_bytes()
+        self.assertNotIn(b"curl", database_bytes)
+        self.assertNotIn(b"/private/project/full/path.txt", database_bytes)
         self.assertNotIn(b"Authorization: Bearer secret", database_bytes)
         self.assertNotIn(b"/private/transcript.jsonl", database_bytes)
+
+    def test_permission_request_noop_does_not_construct_store_or_parse_payload(self):
+        output = io.StringIO()
+        with patch("codex_notify.hooks.NotificationStore") as store_type:
+            self.assertEqual(
+                hook_main("PermissionRequest", io.StringIO("not-json"), output),
+                0,
+            )
+        store_type.assert_not_called()
+        self.assertEqual(output.getvalue(), "")
 
     def test_permission_request_without_confirmed_turn_is_silent_and_returns_no_decision(self):
         output = io.StringIO()

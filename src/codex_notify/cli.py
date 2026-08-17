@@ -20,7 +20,6 @@ from . import __version__
 from .app_server_metadata import find_bundled_codex
 from .computer_use import inspect_computer_use
 from .constants import (
-    HOOK_STATUS_PERMISSION,
     HOOK_STATUS_REQUEST_USER_INPUT,
     HOOK_STATUS_START,
 )
@@ -90,9 +89,9 @@ def _parser() -> argparse.ArgumentParser:
             "UserPromptSubmit",
             "SubagentStart",
             "SubagentStop",
-            "PermissionRequest",
             "PreToolUse",
             "Stop",
+            "PermissionRequest",
         ),
     )
     notify = commands.add_parser("notify", help=argparse.SUPPRESS)
@@ -227,7 +226,7 @@ def _status(store: NotificationStore) -> None:
         f"interrupted={snapshot.get('interrupted_turns', 0)}"
     )
     print(
-        "审批通知："
+        "历史审批通知（旧版本，当前已禁用）："
         f"总计={snapshot.get('permission_total', 0)}，"
         f"已发送={snapshot.get('permission_sent', 0)}"
     )
@@ -365,7 +364,6 @@ def _doctor(paths: AppPaths) -> int:
             "UserPromptSubmit",
             "SubagentStart",
             "SubagentStop",
-            "PermissionRequest",
             "PreToolUse",
         )
     }
@@ -380,14 +378,10 @@ def _doctor(paths: AppPaths) -> int:
                 hook_events_ok[event_name] = any(
                     (
                         (
-                            event_name == "PermissionRequest"
-                            and group.get("matcher") == ".*"
-                        )
-                        or (
                             event_name == "PreToolUse"
                             and group.get("matcher") == "^request_user_input$"
                         )
-                        or event_name not in {"PermissionRequest", "PreToolUse"}
+                        or event_name != "PreToolUse"
                     )
                     and _hook_handler_ok(handler, paths.runner, event_name)
                     for group in groups
@@ -407,7 +401,7 @@ def _doctor(paths: AppPaths) -> int:
                 if not hooks_enabled
                 else (
                     f"{paths.hooks_file}（SessionStart/UserPromptSubmit/SubagentStart/"
-                    "SubagentStop/PermissionRequest/PreToolUse 均需在 /hooks 确认信任）"
+                    "SubagentStop/PreToolUse 均需在 /hooks 确认信任）"
                 )
             ),
         )
