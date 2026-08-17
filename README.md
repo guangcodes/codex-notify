@@ -1,6 +1,6 @@
 # codex-notify
 
-一个面向 macOS 的轻量旁路通知工具：使用 Codex 官方 Hook 观察 Turn 开始和确定的审批请求，结合 `agent-turn-complete` 与一次性只读 App Server 查询校准 Turn 终态，通过可靠的 SQLite 发件队列将消息发送到飞书自定义机器人。
+一个面向 macOS 的轻量旁路通知工具：使用 Codex 官方 Hook 观察 Turn 启动，结合 `agent-turn-complete` 与一次性只读 App Server 查询校准 Turn 终态，通过可靠的 SQLite 发件队列将消息发送到飞书自定义机器人。
 
 它不接管 Codex 客户端，不启动受控 Turn，不读取对话记录或 Codex 私有数据库，也不根据提示词内容猜测 Turn 来源。
 
@@ -21,14 +21,14 @@
 ```text
 SessionStart ────────────────→ 只记录会话生命周期和上下文压缩来源
 UserPromptSubmit ────────────→ PENDING_ROOT_CANDIDATE（统一等待 5 秒）
-PermissionRequest ───────────→ 当前不能证明等待人工审批，始终静默
+PermissionRequest ───────────→ 当前不安装；旧版兼容入口静默
 PreToolUse(request_user_input) → 仅精确归属已确认根 Turn 后登记尽力问题提醒
 SubagentStart/SubagentStop ──→ 保存原始 Hook 身份并推导唯一活动父 Turn
 agent-turn-complete ─────────→ 权威正常完成信号，触发有界终态校准
                                   ↓
                               一次性 metadata-only App Server 查询
                                   ↓
-                    completed / failed / interrupted（静默）
+                      completed / failed（interrupted 静默）
                                   ↗
 LaunchAgent 补偿扫描 ────────→ 只查询已登记且未终态的精确根 Thread/Turn
                                   ↓
@@ -60,9 +60,9 @@ account/rateLimits/read ─────→ 账户限流全局状态（实验，�
 
 完成处理只使用精确的 `(session/thread id, turn_id)`，永不按相同 `turn_id` 跨会话回退。`UNKNOWN`、`UNVERIFIED` 和 `CONFLICT` 均不通知、不合并，也不为缺少已确认来源的完成事件发送独立通知。
 
-`PermissionRequest` 只能证明发生过一次权限检查，无法区分自动审查、人工等待、批准、拒绝或请求已经失效。为避免把瞬时权限检查误报为“Codex 需要审批”，当前版本不安装该 Hook，兼容入口也始终静默且不写入 SQLite；升级时会移除旧版自有 Hook，并抑制尚未发送的历史 permission 队列项。`status` 中的审批计数明确标为旧版本历史记录，不代表当前存在待审批操作。将来只有取得权威、稳定的人工等待及结束状态后才会恢复此类通知。
+`PermissionRequest` 不能区分自动审查、人工等待、批准、拒绝或已经失效，因而不足以证明“Codex 正在等待审批”。当前版本不安装该 Hook；旧版兼容入口静默且不写入 SQLite，升级时会移除旧 Hook 并抑制历史未发送项。`status` 中的审批计数仅为旧版本记录。
 
-后台 worker 只对本地已经精确确认并登记通知的根 Turn 调用 `thread/turns/list(itemsView="notLoaded")`。响应中的 `itemsView` 必须为 `notLoaded` 且 `items` 必须为空；只提取 Turn ID、状态、开始/完成时间、耗时和封闭集合内的结构化错误类别。`completed` 与 `failed` 必须同时具有完成时间才可成为通知终态；当前 App Server 的 `interrupted` 可能只是用户追加消息造成的瞬时状态，因此无条件静默，不进入发送队列。`agent-turn-complete` 到达后先进行有界校准，窗口结束仍不可读时沿用原有 completed 语义。没有正常完成信号时，轻量补偿扫描每轮最多查询一个候选，失败有界退避，24 小时后停止。每个根 Turn 仍只有一个终态事件，且依赖对应 started 事件先发送。
+后台 worker 只对已确认并登记的根 Turn 调用 `thread/turns/list(itemsView="notLoaded")`。响应必须保持 `itemsView="notLoaded"` 且 `items` 为空；只提取身份、状态、时间、耗时和封闭集合内的错误类别。仅带完成时间的 `completed`、`failed` 可成为通知终态；`interrupted` 可能只是用户追加消息造成的瞬时状态，因此始终静默。`agent-turn-complete` 到达后先进行有界校准，不可读时兼容回退为 completed；缺少正常完成信号时每轮最多补偿查询一个候选，失败退避并在 24 小时后停止。
 
 根 Turn 完成后等待固定 5 秒，以父 Turn 的 `last-assistant-message` 为主结果，并按 `SubagentStart.started_at` 合并已完成的确认子结果。子结果使用确定性脱敏与截断，最多 8 项、每项最多 200 字；窗口后到达的结果不补发。整个过程不调用模型生成摘要。
 
@@ -271,8 +271,7 @@ python3 ~/.codex/codex-notify/runner.py uninstall
 
 ## 已知边界
 
-- `agent-turn-complete` 仍是正常完成的权威信号；App Server 补偿扫描只能在精确已登记范围内确认带完成时间的 `completed` 或 `failed`。`interrupted` 当前无权威、稳定的永久中断证据，始终静默。
-- `PermissionRequest` 当前没有权威的“仍在等待人工审批”及结束状态，始终静默；`status` 中的审批计数仅保留历史版本记录。
+- App Server 补偿扫描只能在精确登记范围内确认带完成时间的 `completed`、`failed`；`PermissionRequest` 和 `interrupted` 都缺少权威、稳定的待处理或终止证据，当前不通知。
 - 父子关系是受约束推导，只优化能够由唯一活动父 Turn 和精确子身份共同确认的情况；无法确认时宁可静默。
 - metadata-only 校准依赖 ChatGPT Desktop bundled Codex 的实验性 App Server 契约；缺失、漂移或失败只会降低通知覆盖率，不影响 Codex Desktop。
 - `request_user_input`、MCP 登录状态和账户限流是默认关闭的 best-effort 实验能力；mock/schema 验证不等于真实环境已经触发或无副作用。

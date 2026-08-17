@@ -2,13 +2,16 @@
 
 所有重要变更均记录在此。
 
-## 未发布
+## 0.1.4（2026-08-17）
 
 - 禁止不可靠的 App Server `interrupted` 观测进入发送队列；仅带完成时间的 `completed`、`failed` 可成为通知终态。
 - SQLite v9 迁移静默收敛缺少 App Thread ID 的旧版 RUNNING 根 Turn、抑制尚未发送的历史 interrupted 通知，并保留已有 `agent-turn-complete` 权威完成证据。
 - SQLite 升级到 v10：抑制所有尚未发送或已失败的历史 permission 通知；普通 `PermissionRequest` 不再安装 Hook、写入数据库或进入发送队列。
 - 完整本机绝对路径、Windows drive/UNC 路径、`file://` 链接和凭据在入库前仅对命中片段打码，保留项目与任务上下文；普通 URL、相对仓库路径和 Codex slash command 保持可读。
 - `status` 的“最近错误”只反映仍处于 retry、sending 或 dead 的实际发送错误，不再展示已恢复的历史错误。
+
+发布说明：[GitHub Release v0.1.4](https://github.com/guangcodes/codex-notify/releases/tag/v0.1.4)；
+完整差异：[v0.1.3...v0.1.4](https://github.com/guangcodes/codex-notify/compare/v0.1.3...v0.1.4)。
 
 ## 0.1.3（2026-08-16）
 
