@@ -119,6 +119,20 @@ class AppServerStatusTests(unittest.TestCase):
         )
         self.assertEqual(status.status, "inProgress")
 
+    def test_rejects_terminal_status_without_completed_at(self):
+        for terminal_status in ("completed", "failed", "interrupted"):
+            with self.subTest(status=terminal_status):
+                self.assertIsNone(
+                    self._read(
+                        _turn(
+                            terminal_status,
+                            completedAt=None,
+                            durationMs=None,
+                            error=None,
+                        )
+                    )
+                )
+
     def test_rejects_non_not_loaded_items_view(self):
         self.assertIsNone(self._read(_turn(itemsView="summary")))
 

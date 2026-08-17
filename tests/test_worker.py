@@ -6,7 +6,7 @@ from pathlib import Path
 
 from codex_notify.app_server_metadata import ThreadMetadata
 from codex_notify.app_server_status import TerminalStatus
-from codex_notify.db import HookEvent, NotificationStore, PermissionEvent
+from codex_notify.db import HookEvent, NotificationStore
 from codex_notify.experimental_status import ExperimentalSnapshot
 from codex_notify.experimental_status import McpAuthObservation
 from codex_notify.feishu import DeliveryError
@@ -169,9 +169,6 @@ class WorkerTests(unittest.TestCase):
             HookEvent("session-1", "turn-1", "/work/example", prompt="work"),
             now=100,
         )
-        self.store.record_permission_request(
-            PermissionEvent("session-1", "turn-1", "Shell", "a" * 64), now=101
-        )
         client = _Client()
 
         self.assertEqual(
@@ -188,11 +185,7 @@ class WorkerTests(unittest.TestCase):
             classification = connection.execute(
                 "SELECT classification FROM turns"
             ).fetchone()[0]
-            permission_status = connection.execute(
-                "SELECT status FROM outbox WHERE event_type='permission'"
-            ).fetchone()[0]
         self.assertEqual(classification, "PENDING_ROOT_CANDIDATE")
-        self.assertEqual(permission_status, "pending")
         self.assertEqual(client.messages, [])
 
     def test_worker_defers_metadata_candidates_beyond_single_probe(self):
@@ -520,7 +513,7 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(turn["terminal_status"], "failed")
 
-    def test_compensation_scan_finds_interrupted_without_completion_signal(self):
+    def test_compensation_scan_keeps_interrupted_observation_silent(self):
         self.store.set_enabled(True, now=90)
         self.store.record_start(
             HookEvent("session", "turn", "/work/example", prompt="work"), now=100
@@ -556,9 +549,23 @@ class WorkerTests(unittest.TestCase):
             run_once(self.store, client_factory=lambda: client, now=109), 0
         )
         self.assertEqual(
-            run_once(self.store, client_factory=lambda: client, now=110), 1
+            run_once(
+                self.store,
+                client_factory=lambda: client,
+                status_reader=status_reader,
+                now=110,
+            ),
+            0,
         )
-        self.assertIn("状态：interrupted", client.messages[-1])
+        self.assertEqual(len(client.messages), 1)
+        with self.store.managed_connection() as connection:
+            turn = connection.execute("SELECT * FROM turns").fetchone()
+            completions = connection.execute(
+                "SELECT COUNT(*) FROM outbox WHERE event_type='completed'"
+            ).fetchone()[0]
+        self.assertEqual(turn["lifecycle"], "RUNNING")
+        self.assertIsNone(turn["terminal_status"])
+        self.assertEqual(completions, 0)
 
     def test_agent_completion_falls_back_after_bounded_calibration(self):
         self.store.set_enabled(True, now=90)

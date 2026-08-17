@@ -90,10 +90,10 @@ class NotificationStoreTests(unittest.TestCase):
         with self.store.managed_connection() as connection:
             turn = connection.execute("SELECT cwd, project FROM turns").fetchone()
             payload = json.loads(connection.execute("SELECT payload_json FROM outbox").fetchone()[0])
-        warning = "内容可能包含敏感信息，请回到 Codex 查看。"
         self.assertEqual(turn["cwd"], "")
-        self.assertEqual(turn["project"], warning)
-        self.assertEqual(payload["project"], warning)
+        self.assertEqual(turn["project"], "incident[敏感信息已打码]")
+        self.assertEqual(payload["project"], "incident[敏感信息已打码]")
+        self.assertNotIn(jwt, turn["project"])
 
     def test_connect_scrubs_legacy_raw_cwd_and_trigger_blocks_new_values(self):
         self._start(finalize=False)
@@ -199,6 +199,44 @@ class NotificationStoreTests(unittest.TestCase):
             0,
         )
 
+    def test_status_ignores_historical_error_without_active_failed_delivery(self):
+        with self.store.managed_connection() as connection:
+            connection.execute(
+                "INSERT INTO settings(key, value, updated_at) VALUES('last_error', 'old', 1)"
+            )
+
+        self.assertIsNone(self.store.status_snapshot(now=100)["last_error"])
+
+    def test_status_reports_error_from_active_retry(self):
+        self.store.set_enabled(True, now=1)
+        self._start(now=100)
+        item = self.store.claim_due(limit=1, now=105)[0]
+        self.store.mark_retry(item["id"], "temporary failure", 110)
+
+        self.assertEqual(
+            self.store.status_snapshot(now=106)["last_error"],
+            "temporary failure",
+        )
+
+    def test_status_reports_most_recent_active_failure_not_newest_row(self):
+        self.store.set_enabled(True, now=1)
+        self._start(now=100)
+        first = self.store.claim_due(limit=1, now=105)[0]
+        self.store.mark_retry(first["id"], "newest failure", 120, now=110)
+        with self.store.managed_connection() as connection:
+            connection.execute(
+                """INSERT INTO outbox(
+                       event_key, event_type, payload_json, status, attempts,
+                       next_attempt_at, created_at, last_error, last_error_at
+                   ) VALUES('newer-row', 'test', '{}', 'dead', 1, 100, 200,
+                            'older failure', 100)"""
+            )
+
+        self.assertEqual(
+            self.store.status_snapshot(now=111)["last_error"],
+            "newest failure",
+        )
+
     def test_status_counts_turn_only_conflicts_without_double_counting_relations(self):
         self.store.record_start(
             HookEvent("shared-agent", "turn-1", "", prompt="shared"), now=10
@@ -231,7 +269,7 @@ class NotificationStoreTests(unittest.TestCase):
         recovered = self.store.claim_due(limit=1, now=200)
         self.assertEqual(recovered[0]["attempts"], 2)
 
-    def test_child_permission_is_attributed_to_exact_confirmed_root(self):
+    def test_child_permission_is_silent_even_with_exact_confirmed_root(self):
         self.store.set_enabled(True, now=1)
         self._start(now=10)
         self.store.record_subagent_start(
@@ -251,14 +289,12 @@ class NotificationStoreTests(unittest.TestCase):
             ),
             now=18,
         )
-        self.assertTrue(created)
+        self.assertFalse(created)
         with self.store.managed_connection() as connection:
-            row = connection.execute(
-                "SELECT session_id, turn_id, payload_json FROM outbox "
-                "WHERE event_type='permission'"
-            ).fetchone()
-        self.assertEqual((row["session_id"], row["turn_id"]), ("session-1", "turn-1"))
-        self.assertIn("子任务审批：MCP 工具审批", row["payload_json"])
+            count = connection.execute(
+                "SELECT COUNT(*) FROM outbox WHERE event_type='permission'"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
 
     def test_child_request_user_input_requires_exact_confirmed_root(self):
         self.store.set_enabled(True, now=1)
@@ -347,10 +383,10 @@ class NotificationStoreTests(unittest.TestCase):
         self.assertEqual(row["last_error"], "notifications disabled before root confirmation")
         self.assertEqual(self.store.claim_due(limit=10, now=15), [])
 
-    def test_permission_during_root_confirmation_waits_for_started_delivery(self):
+    def test_permission_during_root_confirmation_is_never_enqueued(self):
         self.store.set_enabled(True, now=1)
         self.store.record_start(self.event, now=100)
-        self.assertTrue(
+        self.assertFalse(
             self.store.record_permission_request(
                 PermissionEvent("session-1", "turn-1", "Shell", "e" * 64),
                 now=101,
@@ -370,13 +406,12 @@ class NotificationStoreTests(unittest.TestCase):
         started = self.store.claim_due(limit=10, now=105)
         self.assertEqual([item["event_type"] for item in started], ["started"])
         self.store.mark_sent(started[0]["id"], now=105)
-        permission = self.store.claim_due(limit=10, now=105)
-        self.assertEqual([item["event_type"] for item in permission], ["permission"])
+        self.assertEqual(self.store.claim_due(limit=10, now=105), [])
 
-    def test_permission_during_unverified_root_confirmation_is_suppressed(self):
+    def test_permission_during_unverified_root_confirmation_is_not_persisted(self):
         self.store.set_enabled(True, now=1)
         self.store.record_start(self.event, now=100)
-        self.assertTrue(
+        self.assertFalse(
             self.store.record_permission_request(
                 PermissionEvent("session-1", "turn-1", "Shell", "f" * 64),
                 now=101,
@@ -385,10 +420,10 @@ class NotificationStoreTests(unittest.TestCase):
 
         self.store.finalize_pending(now=105)
         with self.store.managed_connection() as connection:
-            permission = connection.execute(
-                "SELECT status FROM outbox WHERE event_type='permission'"
-            ).fetchone()
-        self.assertEqual(permission["status"], "suppressed")
+            count = connection.execute(
+                "SELECT COUNT(*) FROM outbox WHERE event_type='permission'"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
 
     def test_permission_stays_silent_after_off_now_and_reenable(self):
         self.store.set_enabled(True, now=1)
@@ -405,11 +440,11 @@ class NotificationStoreTests(unittest.TestCase):
                 0,
             )
 
-    def test_graceful_off_keeps_registered_permission_and_terminal_eligible(self):
+    def test_graceful_off_does_not_restore_permission_notifications(self):
         self.store.set_enabled(True, now=1)
         self._start(now=10)
         self.store.set_enabled(False, now=16)
-        self.assertTrue(
+        self.assertFalse(
             self.store.record_permission_request(
                 PermissionEvent("session-1", "turn-1", "Shell", "c" * 64),
                 now=17,
@@ -420,10 +455,10 @@ class NotificationStoreTests(unittest.TestCase):
                 connection.execute(
                     "SELECT COUNT(*) FROM outbox WHERE event_type='permission'"
                 ).fetchone()[0],
-                1,
+                0,
             )
 
-    def test_permission_is_silent_after_turn_terminalization(self):
+    def test_interrupted_observation_and_permission_request_both_stay_silent(self):
         self.store.set_enabled(True, now=1)
         self.store.record_start(self.event, now=100)
         self.store.record_thread_metadata(
@@ -455,6 +490,9 @@ class NotificationStoreTests(unittest.TestCase):
                 ).fetchone()[0],
                 0,
             )
+            turn = connection.execute("SELECT * FROM turns").fetchone()
+        self.assertEqual(turn["lifecycle"], "RUNNING")
+        self.assertIsNone(turn["terminal_status"])
 
     def test_terminal_race_keeps_first_status_and_one_terminal_event(self):
         self.store.set_enabled(True, now=1)
@@ -484,7 +522,7 @@ class NotificationStoreTests(unittest.TestCase):
             self.store.record_terminal_probe(
                 "session-1",
                 "turn-1",
-                TerminalStatus("turn-1", "interrupted", 100, 108, 8000, None),
+                TerminalStatus("turn-1", "completed", 100, 108, 8000, None),
                 now=108,
             )
         )

@@ -184,7 +184,7 @@ class TurnAggregationTests(unittest.TestCase):
         self.assertEqual(payload["omitted_child_results"], 1)
         self.assertEqual(
             payload["child_results"][0]["summary"],
-            "内容可能包含敏感信息，请回到 Codex 查看。",
+            "[敏感信息已打码]",
         )
         self.assertLessEqual(len(payload["child_results"][1]["summary"]), 200)
 

@@ -110,6 +110,7 @@ CREATE TABLE IF NOT EXISTS outbox (
     created_at REAL NOT NULL,
     sent_at REAL,
     last_error TEXT,
+    last_error_at REAL,
     depends_on_event_key TEXT
 );
 
@@ -161,7 +162,7 @@ CREATE TABLE IF NOT EXISTS experimental_signal_state (
 """
 
 _CWD_SCRUB_SETTING = "raw_cwd_scrubbed_v1"
-_SCHEMA_VERSION = 8
+_SCHEMA_VERSION = 10
 
 _EXPERIMENTAL_EVENT_TYPES = {
     "request-user-input": "experimental_request_user_input",
@@ -334,8 +335,13 @@ class NotificationStore:
         outbox_columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(outbox)")
         }
-        if "depends_on_event_key" not in outbox_columns:
-            connection.execute("ALTER TABLE outbox ADD COLUMN depends_on_event_key TEXT")
+        outbox_additions = {
+            "depends_on_event_key": "TEXT",
+            "last_error_at": "REAL",
+        }
+        for name, declaration in outbox_additions.items():
+            if name not in outbox_columns:
+                connection.execute(f"ALTER TABLE outbox ADD COLUMN {name} {declaration}")
 
         subagent_columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(subagents)")
@@ -494,6 +500,149 @@ class NotificationStore:
                            ELSE NULL END
                    WHERE lifecycle='COMPLETED'
                      AND terminal_status IS NULL"""
+            )
+        if current_version < 9:
+            connection.execute(
+                """DELETE FROM outbox
+                   WHERE event_type='completed'
+                     AND status IN ('pending', 'retry', 'sending', 'dead')
+                     AND json_extract(payload_json, '$.terminal_status')='interrupted'"""
+            )
+            connection.execute(
+                """UPDATE turns
+                   SET classification='UNVERIFIED',
+                       lifecycle='COMPLETED',
+                       state='unverified',
+                       suppressed=1,
+                       notify_pair=0,
+                       suppression_reason=CASE
+                           WHEN EXISTS(
+                               SELECT 1 FROM outbox
+                               WHERE outbox.session_id=turns.session_id
+                                 AND outbox.turn_id=turns.turn_id
+                                 AND outbox.event_type='completed'
+                                 AND outbox.status='sent'
+                           ) THEN 'legacy_unreliable_interrupted_sent'
+                           ELSE 'legacy_unreliable_interrupted_suppressed'
+                       END,
+                       decision_reason=CASE
+                           WHEN EXISTS(
+                               SELECT 1 FROM outbox
+                               WHERE outbox.session_id=turns.session_id
+                                 AND outbox.turn_id=turns.turn_id
+                                 AND outbox.event_type='completed'
+                                 AND outbox.status='sent'
+                           ) THEN 'legacy_unreliable_interrupted_sent'
+                           ELSE 'legacy_unreliable_interrupted_suppressed'
+                       END,
+                       classification_source='v9_interrupted_reconciliation',
+                       terminal_status=NULL,
+                       terminal_source='legacy_unreliable_interrupted',
+                       terminal_error_category=NULL,
+                       terminal_completed_at=NULL,
+                       terminal_duration_ms=NULL,
+                       terminal_check_due_at=NULL,
+                       terminal_calibration_deadline=NULL,
+                       aggregation_due_at=NULL,
+                       terminal_scan_stopped_at=COALESCE(
+                           terminal_scan_stopped_at,
+                           CAST(strftime('%s', 'now') AS REAL)
+                       )
+                   WHERE terminal_status='interrupted'
+                     AND terminal_source='app_server'
+                     AND EXISTS(
+                         SELECT 1 FROM outbox
+                         WHERE outbox.session_id=turns.session_id
+                           AND outbox.turn_id=turns.turn_id
+                           AND outbox.event_type='completed'
+                           AND outbox.status IN ('sent', 'suppressed')
+                     )"""
+            )
+            connection.execute(
+                """UPDATE turns
+                   SET lifecycle='COMPLETED',
+                       state='completed',
+                       completed_at=COALESCE(completed_at, pending_completed_at),
+                       terminal_status=NULL,
+                       terminal_source='',
+                       terminal_error_category=NULL,
+                       terminal_completed_at=NULL,
+                       terminal_duration_ms=NULL,
+                       terminal_check_attempts=0,
+                       terminal_check_due_at=CAST(strftime('%s', 'now') AS REAL),
+                       terminal_calibration_deadline=CAST(strftime('%s', 'now') AS REAL),
+                       aggregation_due_at=NULL,
+                       terminal_scan_stopped_at=NULL
+                   WHERE terminal_status='interrupted'
+                     AND terminal_source='app_server'
+                     AND pending_completed_at IS NOT NULL
+                     AND pending_completion_enabled IS NOT NULL
+                     AND NOT EXISTS(
+                         SELECT 1 FROM outbox
+                         WHERE outbox.session_id=turns.session_id
+                           AND outbox.turn_id=turns.turn_id
+                           AND outbox.event_type='completed'
+                           AND outbox.status='sent'
+                     )"""
+            )
+            connection.execute(
+                """UPDATE turns
+                   SET lifecycle='RUNNING',
+                       state='running',
+                       completed_at=NULL,
+                       pending_completed_at=NULL,
+                       pending_completion_summary='',
+                       pending_completion_enabled=NULL,
+                       terminal_status=NULL,
+                       terminal_source='',
+                       terminal_error_category=NULL,
+                       terminal_completed_at=NULL,
+                       terminal_duration_ms=NULL,
+                       terminal_check_attempts=0,
+                       terminal_check_due_at=CAST(strftime('%s', 'now') AS REAL),
+                       terminal_calibration_deadline=NULL,
+                       aggregation_due_at=NULL,
+                       terminal_scan_stopped_at=NULL
+                   WHERE terminal_status='interrupted'
+                     AND terminal_source='app_server'
+                     AND pending_completion_enabled IS NULL
+                     AND NOT EXISTS(
+                         SELECT 1 FROM outbox
+                         WHERE outbox.session_id=turns.session_id
+                           AND outbox.turn_id=turns.turn_id
+                           AND outbox.event_type='completed'
+                           AND outbox.status='sent'
+                     )"""
+            )
+            connection.execute(
+                """UPDATE turns
+                   SET classification='UNVERIFIED',
+                       lifecycle='COMPLETED',
+                       state='unverified',
+                       suppressed=1,
+                       notify_pair=0,
+                       suppression_reason='legacy_missing_app_thread_id',
+                       decision_reason='legacy_missing_app_thread_id',
+                       classification_source='v9_legacy_runtime_reconciliation',
+                       terminal_check_due_at=NULL,
+                       terminal_calibration_deadline=NULL,
+                       terminal_scan_stopped_at=COALESCE(
+                           terminal_scan_stopped_at,
+                           CAST(strftime('%s', 'now') AS REAL)
+                       )
+                   WHERE classification='NOTIFIABLE_ROOT'
+                     AND lifecycle='RUNNING'
+                     AND app_thread_id IS NULL
+                     AND terminal_status IS NULL"""
+            )
+        if current_version < 10:
+            connection.execute(
+                """UPDATE outbox
+                   SET status='suppressed',
+                       last_error='suppressed by v10 unreliable permission policy',
+                       last_error_at=NULL
+                   WHERE event_type='permission'
+                     AND status IN ('pending', 'retry', 'sending', 'dead')"""
             )
         if current_version < _SCHEMA_VERSION:
             connection.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
@@ -1218,86 +1367,9 @@ class NotificationStore:
     ) -> bool:
         if not _valid_permission_event(event):
             return False
-        now = now if now is not None else time.time()
-        with self.managed_connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            source = connection.execute(
-                "SELECT * FROM turns WHERE session_id=? AND turn_id=?",
-                (event.session_id, event.turn_id),
-            ).fetchone()
-            if source is None:
-                return False
-            if source["lifecycle"] != "RUNNING" or source["terminal_status"] is not None:
-                return False
-            is_child = source["classification"] == "CONFIRMED_CHILD"
-            root = source
-            if is_child:
-                if (
-                    source["relation_state"] != "CONFIRMED"
-                    or not source["parent_session_id"]
-                    or not source["parent_turn_id"]
-                ):
-                    return False
-                root = connection.execute(
-                    """SELECT * FROM turns
-                       WHERE session_id=? AND turn_id=?
-                         AND classification='NOTIFIABLE_ROOT'""",
-                    (source["parent_session_id"], source["parent_turn_id"]),
-                ).fetchone()
-                if root is None:
-                    return False
-            elif source["classification"] not in {
-                "PENDING_ROOT_CANDIDATE",
-                "NOTIFIABLE_ROOT",
-            }:
-                return False
-            if (
-                root["lifecycle"] != "RUNNING"
-                or root["terminal_status"] is not None
-                or not root["notify_pair"]
-                or root["suppressed"]
-            ):
-                return False
-            start = self._start_outbox_row(connection, root)
-            pending_root = root["classification"] == "PENDING_ROOT_CANDIDATE"
-            if (start is None and not pending_root) or (
-                start is not None and start["status"] == "suppressed"
-            ):
-                return False
-            operation = _permission_operation(event.tool_name)
-            if is_child:
-                operation = f"子任务审批：{operation}"
-            event_key = _event_key(
-                root["session_id"],
-                root["turn_id"],
-                f"permission:{event.event_fingerprint}",
-            )
-            cursor = self._insert_outbox(
-                connection,
-                event_key=event_key,
-                event_type="permission",
-                session_id=root["session_id"],
-                turn_id=root["turn_id"],
-                payload={
-                    "project": root["project"],
-                    "turn_id": root["turn_id"],
-                    "event_id": _delivery_id(event_key),
-                    "occurred_at": now,
-                    "summary": operation,
-                    "reason": safe_summary(event.reason, 160),
-                    "confirmed": True,
-                },
-                due_at=(
-                    max(now, float(root["decision_due_at"]))
-                    if pending_root and root["decision_due_at"] is not None
-                    else now
-                ),
-                now=now,
-                depends_on_event_key=_event_key(
-                    root["session_id"], root["turn_id"], "started"
-                ),
-            )
-            return cursor.rowcount == 1
+        # PermissionRequest does not distinguish auto-review from a durable
+        # request that is still waiting for a human.  Do not enqueue it.
+        return False
 
     def record_request_user_input(
         self, event: RequestUserInputEvent, *, now: float | None = None
@@ -1836,7 +1908,7 @@ class NotificationStore:
                 )
                 return False
             observed_status = getattr(status, "status", None)
-            if observed_status == "inProgress":
+            if observed_status in {"inProgress", "interrupted"}:
                 delay = TERMINAL_SCAN_RETRY_SECONDS[
                     min(attempts - 1, len(TERMINAL_SCAN_RETRY_SECONDS) - 1)
                 ]
@@ -1865,7 +1937,7 @@ class NotificationStore:
                     ),
                 )
                 return False
-            if observed_status not in {"completed", "failed", "interrupted"}:
+            if observed_status not in {"completed", "failed"}:
                 return False
             existing = turn["terminal_status"]
             if existing is not None:
@@ -1964,7 +2036,7 @@ class NotificationStore:
                 """SELECT * FROM turns
                    WHERE classification='NOTIFIABLE_ROOT'
                      AND lifecycle='COMPLETED'
-                     AND terminal_status IN ('completed', 'failed', 'interrupted')
+                     AND terminal_status IN ('completed', 'failed')
                      AND notify_pair=1 AND suppressed=0
                      AND aggregation_due_at IS NOT NULL
                      AND aggregation_due_at<=?
@@ -2153,9 +2225,10 @@ class NotificationStore:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """UPDATE outbox
-                   SET status='retry', last_error='recovered expired worker lease'
+                   SET status='retry', last_error='recovered expired worker lease',
+                       last_error_at=?
                    WHERE status='sending' AND next_attempt_at<=?""",
-                (now,),
+                (now, now),
             )
             connection.execute(
                 """UPDATE outbox AS dependent
@@ -2228,10 +2301,11 @@ class NotificationStore:
             connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """UPDATE outbox
-                   SET status='retry', last_error='recovered expired worker lease'
+                   SET status='retry', last_error='recovered expired worker lease',
+                       last_error_at=?
                    WHERE event_key=? AND event_type='test'
                      AND status='sending' AND next_attempt_at<=?""",
-                (event_key, now),
+                (now, event_key, now),
             )
             row = connection.execute(
                 """SELECT * FROM outbox
@@ -2266,7 +2340,8 @@ class NotificationStore:
         now = now if now is not None else time.time()
         with self.managed_connection() as connection:
             cursor = connection.execute(
-                """UPDATE outbox SET status='sent', sent_at=?, last_error=NULL
+                """UPDATE outbox
+                   SET status='sent', sent_at=?, last_error=NULL, last_error_at=NULL
                    WHERE id=? AND status='sending'""",
                 (now, item_id),
             )
@@ -2275,22 +2350,34 @@ class NotificationStore:
             self._write_setting(connection, "last_delivery_at", str(now), now)
             return True
 
-    def mark_retry(self, item_id: int, error: str, next_attempt_at: float) -> None:
+    def mark_retry(
+        self,
+        item_id: int,
+        error: str,
+        next_attempt_at: float,
+        *,
+        now: float | None = None,
+    ) -> None:
+        now = now if now is not None else time.time()
         with self.managed_connection() as connection:
             cursor = connection.execute(
-                """UPDATE outbox SET status='retry', next_attempt_at=?, last_error=?
+                """UPDATE outbox
+                   SET status='retry', next_attempt_at=?, last_error=?, last_error_at=?
                    WHERE id=? AND status='sending'""",
-                (next_attempt_at, safe_summary(error, 500), item_id),
+                (next_attempt_at, safe_summary(error, 500), now, item_id),
             )
             if cursor.rowcount == 1:
                 self._record_last_error(connection, error)
 
-    def mark_dead(self, item_id: int, error: str) -> None:
+    def mark_dead(
+        self, item_id: int, error: str, *, now: float | None = None
+    ) -> None:
+        now = now if now is not None else time.time()
         with self.managed_connection() as connection:
             cursor = connection.execute(
-                """UPDATE outbox SET status='dead', last_error=?
+                """UPDATE outbox SET status='dead', last_error=?, last_error_at=?
                    WHERE id=? AND status='sending'""",
-                (safe_summary(error, 500), item_id),
+                (safe_summary(error, 500), now, item_id),
             )
             if cursor.rowcount == 1:
                 self._record_last_error(connection, error)
@@ -2422,6 +2509,13 @@ class NotificationStore:
                 """SELECT COUNT(*) AS count FROM outbox
                    WHERE event_type LIKE 'experimental_%' AND status='sent'"""
             ).fetchone()["count"]
+            active_error = connection.execute(
+                """SELECT last_error FROM outbox
+                   WHERE status IN ('retry', 'sending', 'dead')
+                     AND last_error IS NOT NULL AND last_error<>''
+                   ORDER BY (last_error_at IS NULL), last_error_at DESC, id DESC
+                   LIMIT 1"""
+            ).fetchone()
             return {
                 "enabled": enabled,
                 "active_turns": active,
@@ -2451,7 +2545,7 @@ class NotificationStore:
                 "last_terminal_query_at": settings.get("last_terminal_query_at"),
                 "dead": counts.get("dead", 0),
                 "last_delivery_at": settings.get("last_delivery_at"),
-                "last_error": settings.get("last_error"),
+                "last_error": active_error["last_error"] if active_error else None,
             }
 
 
@@ -2520,16 +2614,3 @@ def _experimental_payload(
         "event_id": _delivery_id(event_key),
         "display_name": safe_summary(display_name, 80),
     }
-
-
-def _permission_operation(tool_name: str) -> str:
-    normalized = "".join(character for character in tool_name.lower() if character.isalnum())
-    if any(marker in normalized for marker in ("shell", "command", "exec", "bash")):
-        return "命令执行审批"
-    if any(marker in normalized for marker in ("applypatch", "filewrite", "edit", "write")):
-        return "文件变更审批"
-    if any(marker in normalized for marker in ("network", "websearch", "web", "http")):
-        return "网络访问审批"
-    if "mcp" in normalized:
-        return "MCP 工具审批"
-    return "工具权限审批"

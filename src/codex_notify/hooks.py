@@ -10,7 +10,6 @@ from typing import Any, TextIO
 from .db import (
     HookEvent,
     NotificationStore,
-    PermissionEvent,
     RequestUserInputEvent,
     SubagentEvent,
 )
@@ -32,6 +31,10 @@ def process_hook(
     payload: dict[str, Any],
     store: NotificationStore | None = None,
 ) -> None:
+    if event_name == "PermissionRequest":
+        # Compatibility no-op for Hook configurations installed by older
+        # releases. Return before opening or migrating the notification DB.
+        return
     store = store or NotificationStore()
     if event_name == "SessionStart":
         store.record_session_start(
@@ -51,22 +54,6 @@ def process_hook(
             store.record_subagent_start(relation)
         else:
             store.record_subagent_stop(relation)
-    elif event_name == "PermissionRequest":
-        canonical = json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        fingerprint = hashlib.sha256(canonical).hexdigest()
-        store.record_permission_request(
-            PermissionEvent(
-                session_id=str(payload.get("session_id") or ""),
-                turn_id=str(payload.get("turn_id") or ""),
-                tool_name=str(payload.get("tool_name") or ""),
-                event_fingerprint=fingerprint,
-            )
-        )
     elif event_name == "PreToolUse":
         tool_name = payload.get("tool_name")
         if tool_name != "request_user_input":
@@ -106,6 +93,10 @@ def hook_main(
 ) -> int:
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
+    if event_name == "PermissionRequest":
+        # Do not even parse or log legacy payloads: this source cannot prove
+        # that a human approval is currently pending.
+        return 0
     try:
         payload = json.load(stdin)
         if not isinstance(payload, dict):

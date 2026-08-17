@@ -389,7 +389,7 @@ class TurnStateTests(unittest.TestCase):
             legacy_table = connection.execute(
                 "SELECT name FROM sqlite_master WHERE name='managed_launchers'"
             ).fetchone()
-        self.assertEqual(version, 8)
+        self.assertEqual(version, 10)
         self.assertEqual(turn["classification"], "NOTIFIABLE_ROOT")
         self.assertEqual(turn["lifecycle"], "COMPLETED")
         self.assertEqual(turn["terminal_status"], "completed")
@@ -522,6 +522,251 @@ class TurnStateTests(unittest.TestCase):
         with NotificationStore(paths).managed_connection() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
         self.assertEqual(version, 99)
+
+    def test_v8_migration_silences_unobservable_legacy_running_roots(self):
+        root = Path(self.temp_dir.name) / "v8-running"
+        paths = AppPaths(root)
+        store = NotificationStore(paths)
+        with store.managed_connection() as connection:
+            connection.execute("PRAGMA user_version=8")
+            connection.execute(
+                """INSERT INTO turns(
+                       session_id, turn_id, cwd, project, prompt_summary,
+                       started_at, notify_pair, suppressed, state,
+                       classification, lifecycle, decision_reason,
+                       app_thread_id, terminal_status
+                   ) VALUES('legacy-running', 'turn', '', 'demo', 'work',
+                            10, 1, 0, 'running', 'NOTIFIABLE_ROOT', 'RUNNING',
+                            'legacy_sent_start_pair', NULL, NULL)"""
+            )
+            connection.execute(
+                """INSERT INTO outbox(
+                       event_key, session_id, turn_id, event_type, payload_json,
+                       status, attempts, next_attempt_at, created_at, sent_at
+                   ) VALUES('legacy-start', 'legacy-running', 'turn', 'started',
+                            '{}', 'sent', 1, 10, 10, 11)"""
+            )
+            connection.execute(
+                """INSERT INTO outbox(
+                       event_key, session_id, turn_id, event_type, payload_json,
+                       status, attempts, next_attempt_at, created_at
+                   ) VALUES('legacy-interrupted', 'legacy-running', 'turn',
+                            'completed', '{"terminal_status":"interrupted"}',
+                            'pending', 0, 12, 12)"""
+            )
+
+        migrated = NotificationStore(paths)
+        with migrated.managed_connection() as connection:
+            turn = connection.execute(
+                "SELECT * FROM turns WHERE session_id='legacy-running'"
+            ).fetchone()
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            outbox_rows = connection.execute(
+                "SELECT event_type, status FROM outbox ORDER BY id"
+            ).fetchall()
+
+        self.assertEqual(version, 10)
+        self.assertEqual(turn["classification"], "UNVERIFIED")
+        self.assertEqual(turn["lifecycle"], "COMPLETED")
+        self.assertEqual(turn["state"], "unverified")
+        self.assertEqual(turn["suppressed"], 1)
+        self.assertEqual(turn["notify_pair"], 0)
+        self.assertEqual(
+            turn["suppression_reason"], "legacy_missing_app_thread_id"
+        )
+        self.assertIsNotNone(turn["terminal_scan_stopped_at"])
+        self.assertEqual(
+            [tuple(row) for row in outbox_rows],
+            [("started", "sent")],
+        )
+
+    def test_v8_migration_reconciles_unreliable_interrupted_observations(self):
+        root = Path(self.temp_dir.name) / "v8-interrupted"
+        paths = AppPaths(root)
+        store = NotificationStore(paths)
+        with store.managed_connection() as connection:
+            connection.execute("PRAGMA user_version=8")
+            for session_id, completion_status in (
+                ("already-sent", "sent"),
+                ("not-sent", "pending"),
+                ("dead-unsent", "dead"),
+                ("user-suppressed", "suppressed"),
+            ):
+                connection.execute(
+                    """INSERT INTO turns(
+                           session_id, turn_id, cwd, project, prompt_summary,
+                           started_at, completed_at, notify_pair, suppressed,
+                           state, classification, lifecycle, decision_reason,
+                           app_thread_id, terminal_status, terminal_source,
+                           terminal_started_at, terminal_completed_at,
+                           terminal_duration_ms, pending_completed_at,
+                           pending_completion_enabled, aggregation_due_at
+                       ) VALUES(?, 'turn', '', 'demo', 'work', 10, 12, 1, 0,
+                                'interrupted', 'NOTIFIABLE_ROOT', 'COMPLETED',
+                                'metadata_confirmed_root', ?, 'interrupted',
+                                'app_server', 10, NULL, NULL, 12, NULL, 17)""",
+                    (session_id, f"thread-{session_id}"),
+                )
+                connection.execute(
+                    """INSERT INTO outbox(
+                           event_key, session_id, turn_id, event_type,
+                           payload_json, status, attempts, next_attempt_at,
+                           created_at, sent_at
+                       ) VALUES(?, ?, 'turn', 'completed',
+                                '{"terminal_status":"interrupted"}', ?, 1,
+                                12, 12, ?)""",
+                    (
+                        f"completion-{session_id}",
+                        session_id,
+                        completion_status,
+                        13 if completion_status == "sent" else None,
+                    ),
+                )
+            connection.execute(
+                """INSERT INTO turns(
+                       session_id, turn_id, cwd, project, prompt_summary,
+                       started_at, completed_at, notify_pair, suppressed,
+                       state, classification, lifecycle, decision_reason,
+                       app_thread_id, terminal_status, terminal_source,
+                       terminal_started_at, terminal_completed_at,
+                       terminal_duration_ms, pending_completed_at,
+                       pending_completion_summary, pending_completion_enabled,
+                       aggregation_due_at
+                   ) VALUES('hook-completed', 'turn', '', 'demo', 'work',
+                            10, 11, 1, 0, 'interrupted', 'NOTIFIABLE_ROOT',
+                            'COMPLETED', 'metadata_confirmed_root',
+                            'thread-hook-completed', 'interrupted', 'app_server',
+                            10, 12, 2000, 11, 'authoritative result', 1, 17)"""
+            )
+            connection.execute(
+                """INSERT INTO outbox(
+                       event_key, session_id, turn_id, event_type, payload_json,
+                       status, attempts, next_attempt_at, created_at, sent_at
+                   ) VALUES('start-hook-completed', 'hook-completed', 'turn',
+                            'started', '{}', 'sent', 1, 10, 10, 10)"""
+            )
+            connection.execute(
+                """INSERT INTO outbox(
+                       event_key, session_id, turn_id, event_type, payload_json,
+                       status, attempts, next_attempt_at, created_at
+                   ) VALUES('completion-hook-completed', 'hook-completed', 'turn',
+                            'completed', '{"terminal_status":"interrupted"}',
+                            'pending', 0, 12, 12)"""
+            )
+
+        migrated = NotificationStore(paths)
+        with migrated.managed_connection() as connection:
+            sent = connection.execute(
+                "SELECT * FROM turns WHERE session_id='already-sent'"
+            ).fetchone()
+            unsent = connection.execute(
+                "SELECT * FROM turns WHERE session_id='not-sent'"
+            ).fetchone()
+            dead = connection.execute(
+                "SELECT * FROM turns WHERE session_id='dead-unsent'"
+            ).fetchone()
+            suppressed = connection.execute(
+                "SELECT * FROM turns WHERE session_id='user-suppressed'"
+            ).fetchone()
+            hook_completed = connection.execute(
+                "SELECT * FROM turns WHERE session_id='hook-completed'"
+            ).fetchone()
+            outbox = connection.execute(
+                "SELECT session_id, status FROM outbox ORDER BY id"
+            ).fetchall()
+
+        self.assertEqual(sent["classification"], "UNVERIFIED")
+        self.assertEqual(sent["lifecycle"], "COMPLETED")
+        self.assertEqual(sent["state"], "unverified")
+        self.assertEqual(sent["suppressed"], 1)
+        self.assertIsNone(sent["terminal_status"])
+        self.assertEqual(
+            sent["suppression_reason"], "legacy_unreliable_interrupted_sent"
+        )
+        self.assertEqual(unsent["classification"], "NOTIFIABLE_ROOT")
+        self.assertEqual(unsent["lifecycle"], "RUNNING")
+        self.assertEqual(unsent["state"], "running")
+        self.assertIsNone(unsent["terminal_status"])
+        self.assertIsNone(unsent["pending_completed_at"])
+        self.assertIsNone(unsent["pending_completion_enabled"])
+        self.assertIsNotNone(unsent["terminal_check_due_at"])
+        self.assertEqual(dead["lifecycle"], "RUNNING")
+        self.assertIsNone(dead["terminal_status"])
+        self.assertIsNone(dead["pending_completed_at"])
+        self.assertEqual(suppressed["classification"], "UNVERIFIED")
+        self.assertEqual(suppressed["lifecycle"], "COMPLETED")
+        self.assertEqual(suppressed["suppressed"], 1)
+        self.assertEqual(
+            suppressed["suppression_reason"],
+            "legacy_unreliable_interrupted_suppressed",
+        )
+        self.assertEqual(hook_completed["lifecycle"], "COMPLETED")
+        self.assertEqual(hook_completed["state"], "completed")
+        self.assertEqual(hook_completed["pending_completed_at"], 11)
+        self.assertEqual(
+            hook_completed["pending_completion_summary"], "authoritative result"
+        )
+        self.assertIsNone(hook_completed["terminal_status"])
+        self.assertIsNotNone(hook_completed["terminal_check_due_at"])
+        self.assertIsNotNone(hook_completed["terminal_calibration_deadline"])
+        self.assertEqual(
+            [tuple(row) for row in outbox],
+            [
+                ("already-sent", "sent"),
+                ("user-suppressed", "suppressed"),
+                ("hook-completed", "sent"),
+            ],
+        )
+
+        migrated.finalize_aggregations(now=2_000_000_000)
+        with migrated.managed_connection() as connection:
+            recovered = connection.execute(
+                """SELECT payload_json FROM outbox
+                   WHERE session_id='hook-completed' AND event_type='completed'"""
+            ).fetchone()
+        self.assertEqual(json.loads(recovered["payload_json"])["terminal_status"], "completed")
+
+    def test_v9_migration_suppresses_all_unsent_permission_notifications(self):
+        root = Path(self.temp_dir.name) / "v9-permissions"
+        paths = AppPaths(root)
+        store = NotificationStore(paths)
+        with store.managed_connection() as connection:
+            connection.execute("PRAGMA user_version=9")
+            for index, status in enumerate(
+                ("pending", "retry", "sending", "dead", "sent", "suppressed")
+            ):
+                connection.execute(
+                    """INSERT INTO outbox(
+                           event_key, event_type, payload_json, status, attempts,
+                           next_attempt_at, created_at, sent_at, last_error,
+                           last_error_at
+                       ) VALUES(?, 'permission', '{}', ?, 1, 10, 10, ?, ?, 9)""",
+                    (
+                        f"permission-{status}",
+                        status,
+                        11 if status == "sent" else None,
+                        "old failure" if status in {"retry", "dead"} else None,
+                    ),
+                )
+
+        migrated = NotificationStore(paths)
+        with migrated.managed_connection() as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            rows = connection.execute(
+                """SELECT event_key, status, last_error, last_error_at
+                   FROM outbox ORDER BY id"""
+            ).fetchall()
+
+        self.assertEqual(version, 10)
+        for row in rows[:4]:
+            self.assertEqual(row["status"], "suppressed")
+            self.assertEqual(
+                row["last_error"],
+                "suppressed by v10 unreliable permission policy",
+            )
+            self.assertIsNone(row["last_error_at"])
+        self.assertEqual(rows[4]["status"], "sent")
+        self.assertEqual(rows[5]["status"], "suppressed")
 
     def test_v6_migration_uses_delivery_file_lock(self):
         root = Path(self.temp_dir.name) / "migration-lock"

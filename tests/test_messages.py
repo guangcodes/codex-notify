@@ -46,6 +46,40 @@ class ExperimentalMessageTests(unittest.TestCase):
             self.assertNotIn("Turn：", message)
             self.assertIn("信号：safe-signal", message)
 
+    def test_defensive_legacy_permission_copy_does_not_claim_pending_approval(self):
+        message = render_message(
+            "permission",
+            self.payload(
+                project="demo",
+                turn_id="turn-1234567890",
+                summary="命令执行审批",
+            ),
+        )
+        self.assertIn("权限检查记录", message)
+        self.assertIn("不代表当前仍在等待人工审批", message)
+        self.assertNotIn("Codex 需要审批", message)
+
+    def test_legacy_queued_payload_is_resanitized_at_delivery(self):
+        local_path = "/" + "Users/alice/private/report.md"
+        message = render_message(
+            "completed",
+            self.payload(
+                project="demo",
+                turn_id="turn-1234567890",
+                terminal_status="completed",
+                duration_seconds=1,
+                summary=f"任务完成，输出 {local_path}",
+                child_results=[
+                    {"agent_type": "worker", "summary": f"读取 {local_path}"}
+                ],
+            ),
+        )
+
+        self.assertNotIn(local_path, message)
+        self.assertEqual(message.count("[本地路径已打码]"), 2)
+        self.assertIn("任务完成", message)
+        self.assertIn("子任务结果", message)
+
 
 if __name__ == "__main__":
     unittest.main()

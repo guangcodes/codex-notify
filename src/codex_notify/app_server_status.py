@@ -71,7 +71,7 @@ class TerminalStatus:
 
     @property
     def is_terminal(self) -> bool:
-        return self.status in {"completed", "failed", "interrupted"}
+        return self.status in {"completed", "failed"}
 
 
 def _identifier(value: object) -> str | None:
@@ -149,6 +149,12 @@ def _parse_turn(value: object) -> TerminalStatus | None:
         item is _INVALID
         for item in (started_at, completed_at, duration_ms, error_category)
     ):
+        return None
+    # A separately started App Server can expose a transient terminal-looking
+    # status while the desktop host is still steering the same Turn.  Real
+    # terminal observations must carry their completion timestamp; otherwise
+    # keep scanning instead of freezing and notifying an unconfirmed state.
+    if status in {"completed", "failed", "interrupted"} and completed_at is None:
         return None
     return TerminalStatus(
         turn_id,
